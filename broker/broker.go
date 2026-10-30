@@ -18,7 +18,19 @@ type Broker interface {
 	// Subscribe calls h for every message matching subject. Subjects may
 	// contain "*" wildcards for single tokens. A non-empty queue load
 	// balances messages across subscribers sharing that queue name.
-	Subscribe(subject, queue string, h func(*Message)) (Subscription, error)
+	//
+	// h returns nil when the message was handled. Brokers with
+	// acknowledgements (see jsbroker) ack on nil, redeliver on an error, and
+	// drop messages whose error wraps ErrMalformed. Others ignore it.
+	Subscribe(subject, queue string, h func(*Message) error) (Subscription, error)
+}
+
+// Endpoint is where a receive operation listens: the subject pattern and
+// queue name it passes to Broker.Subscribe. Generated code declares one per
+// receive operation, e.g. to create or bind JetStream consumers.
+type Endpoint struct {
+	Subject string
+	Queue   string
 }
 
 // Subscription is an active subscription.

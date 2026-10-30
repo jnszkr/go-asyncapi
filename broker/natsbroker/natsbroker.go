@@ -33,8 +33,10 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 	return fromNATS(rm), nil
 }
 
-func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message)) (broker.Subscription, error) {
-	cb := func(m *nats.Msg) { h(fromNATS(m)) }
+// Subscribe uses a core NATS subscription, which has no acknowledgements:
+// the error returned by h is ignored.
+func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message) error) (broker.Subscription, error) {
+	cb := func(m *nats.Msg) { _ = h(fromNATS(m)) }
 	if queue != "" {
 		return b.nc.QueueSubscribe(subject, queue, cb)
 	}

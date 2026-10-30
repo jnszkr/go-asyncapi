@@ -34,6 +34,10 @@ type channel struct {
 
 func (c *channel) HasParams() bool { return len(c.Params) > 0 }
 
+// Pattern is the address with every parameter replaced by "*", the subject
+// receive operations subscribe to.
+func (c *channel) Pattern() string { return paramRe.ReplaceAllString(c.Address, "*") }
+
 // HasAllowed reports whether any parameter restricts its values.
 func (c *channel) HasAllowed() bool {
 	for _, p := range c.Params {
@@ -81,6 +85,16 @@ type operation struct {
 }
 
 func (o *operation) IsSend() bool    { return o.Action == spec.ActionSend }
+
+// HasReceive reports whether any operation subscribes.
+func (m *model) HasReceive() bool {
+	for _, o := range m.Ops {
+		if !o.IsSend() {
+			return true
+		}
+	}
+	return false
+}
 func (o *operation) IsReceive() bool { return o.Action == spec.ActionReceive }
 
 var paramRe = regexp.MustCompile(`\{([^{}]+)\}`)
