@@ -1,4 +1,5 @@
-// Package codegen generates a typed NATS client package from an AsyncAPI document.
+// Package codegen generates models, channel definitions and a thin typed
+// client on top of package broker from an AsyncAPI document.
 package codegen
 
 import (
@@ -34,11 +35,8 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 	m.Imports = imports(m)
 
 	tmpl, err := template.New("gen").Funcs(template.FuncMap{
-		"export":       exportName,
-		"lines":        func(s string) []string { return strings.Split(strings.TrimSpace(s), "\n") },
-		"formatHeader": formatHeader,
-		"parseHeader":  parseHeader,
-		"fail":         failStmt,
+		"export": exportName,
+		"lines":  func(s string) []string { return strings.Split(strings.TrimSpace(s), "\n") },
 	}).Parse(tmplSrc)
 	if err != nil {
 		return nil, err
@@ -57,15 +55,13 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 
 // imports returns the stdlib imports used by the generated file.
 func imports(m *model) []string {
-	set := map[string]bool{"encoding/json": true, "fmt": true, "strings": true, "time": true, "context": true}
+	set := map[string]bool{}
 	for _, imp := range m.Imports {
 		set[imp] = true
 	}
-	for _, h := range m.Headers {
-		for _, f := range h.Fields {
-			if f.Type != "string" {
-				set["strconv"] = true
-			}
+	for _, op := range m.Ops {
+		if op.IsSend() {
+			set["context"] = true
 		}
 	}
 	out := make([]string, 0, len(set))
@@ -74,38 +70,4 @@ func imports(m *model) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func formatHeader(typ, expr string) string {
-	switch typ {
-	case "int64":
-		return "strconv.FormatInt(" + expr + ", 10)"
-	case "float64":
-		return "strconv.FormatFloat(" + expr + ", 'g', -1, 64)"
-	case "bool":
-		return "strconv.FormatBool(" + expr + ")"
-	}
-	return expr
-}
-
-func parseHeader(typ, expr string) string {
-	switch typ {
-	case "int64":
-		return "strconv.ParseInt(" + expr + ", 10, 64)"
-	case "float64":
-		return "strconv.ParseFloat(" + expr + ", 64)"
-	case "bool":
-		return "strconv.ParseBool(" + expr + ")"
-	}
-	return expr + ", error(nil)"
-}
-
-// failStmt is the statement a received-message callback runs when decoding fails.
-func failStmt(op *operation) string {
-	if op.Reply != nil {
-		return `c.respondError(m, "400", err)
-			return`
-	}
-	return fmt.Sprintf(`c.errorHandler(fmt.Errorf("%s %%s: %%w", m.Subject, err))
-			return`, op.Key)
 }

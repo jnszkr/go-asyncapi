@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"go/token"
 	"strings"
 	"unicode"
 )
@@ -66,4 +67,30 @@ func splitWords(s string) []string {
 	}
 	flush()
 	return words
+}
+
+// argName returns an unexported Go identifier for use as a function
+// parameter ("userId" → "userID", "type" → "type_").
+func argName(s string) string {
+	name := exportName(s)
+	words := splitWords(name)
+	if len(words) > 0 && commonInitialisms[strings.ToUpper(words[0])] {
+		name = strings.ToLower(words[0]) + name[len(words[0]):]
+	} else {
+		r := []rune(name)
+		r[0] = unicode.ToLower(r[0])
+		name = string(r)
+	}
+	if token.IsKeyword(name) || isReservedArg(name) {
+		name += "_"
+	}
+	return name
+}
+
+func isReservedArg(name string) bool {
+	switch name {
+	case "ctx", "msg", "req", "opts", "c", "h", "string", "error", "any", "len", "new", "make", "nil":
+		return true
+	}
+	return false
 }

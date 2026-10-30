@@ -19,28 +19,31 @@ asyncapi-gen -spec asyncapi.yaml -out ./gen/events -package events
 | operation | `queue` (string, ≤255 chars), `bindingVersion` | `receive` ops use `QueueSubscribe` with that queue |
 | message   | none (reserved)                          | accepted, ignored                                |
 
-## Mapping AsyncAPI 3.0 → Go
+## Design: generic runtime, thin generated code
+
+All messaging logic lives in the importable `broker` package and is written once with
+generics: `Channel[T]`, `Publish[T]`, `Subscribe[T]`, `Request[Req, Resp]`,
+`Respond[Req, Resp]`. Transports implement the small `broker.Broker` interface
+(`natsbroker` for NATS, `membroker` in memory for tests).
+
+The generator only emits what is specific to a document:
 
 | AsyncAPI                         | Generated Go                                                     |
 |----------------------------------|------------------------------------------------------------------|
 | `components.schemas.*`, message payloads | structs / named types (JSON tags, `omitempty` for optional fields) |
-| channel `address` (`user.{id}.signup`) | `XxxSubject(params)` builder, `XxxSubjectPattern` (`user.*.signup`) and a parser that extracts params from an incoming subject |
-| channel `parameters`             | `XxxParams` struct                                               |
-| `send` operation                 | `(*Client).Xxx(ctx, params, msg) error` → `nats.Conn.PublishMsg` |
-| `receive` operation              | `(*Client).Xxx(handler) (*nats.Subscription, error)` → `Subscribe` / `QueueSubscribe` |
-| `send` + `reply`                 | request: `(*Client).Xxx(ctx, params, req) (Resp, error)` → `RequestMsgWithContext` |
-| `receive` + `reply`              | responder: handler returns a reply which is sent to `msg.Reply`  |
-| message `headers` (object schema)| typed headers struct mapped to `nats.Header`                     |
-| message `contentType` / `defaultContentType` | JSON codec by default; pluggable `Codec` option          |
-
-The generated package depends only on `github.com/nats-io/nats.go` and the stdlib.
+| channel `address` + `parameters` | `XxxChannel = broker.Channel[T]{Address, Allowed}` and `XxxParams(...) broker.Params` |
+| `send` / `receive` operations    | one-line `Client` methods calling `Publish` / `Subscribe` (`Queue` from the NATS binding) |
+| `send` / `receive` + `reply`     | one-line `Client` methods calling `Request` / `Respond`          |
+| message `headers`                | header-name constants                                            |
+| `contentType`                    | JSON codec by default; `broker.WithCodec` to replace it          |
 
 ## Architecture
 
 ```
 cmd/asyncapi-gen      CLI entrypoint (flags, IO)
+broker/               generic runtime used by generated code
 internal/spec         AsyncAPI document model, YAML/JSON loader, local $ref resolution, validation
-internal/codegen      spec → intermediate model (names, Go types) → text/template → gofmt
+internal/codegen      spec → intermediate model → text/template → gofmt
 examples/             sample specs + checked-in generated output (also golden files)
 ```
 
@@ -53,7 +56,8 @@ examples/             sample specs + checked-in generated output (also golden fi
    - Publish / subscribe / queue-subscribe / request-reply
    - Golden-file tests and an integration test against an embedded `nats-server`
 2. **Breadth**
-   - Multiple messages per operation (discriminated decoding)
+   - Multiple message types per channel / operation (discriminated decoding)
+   - Typed header structs on top of `broker.Header`
    - `oneOf` / `anyOf` / `allOf` schemas
    - AsyncAPI 2.6 input (publish/subscribe semantics inverted vs 3.0)
    - External file `$ref`s

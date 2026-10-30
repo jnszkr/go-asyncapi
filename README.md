@@ -22,51 +22,81 @@ or from a `go:generate` directive:
 //go:generate go run github.com/jnszkr/go-asyncapi/cmd/asyncapi-gen -spec asyncapi.yaml -out gen/orders
 ```
 
-The generated package depends only on `github.com/nats-io/nats.go`.
+## How it fits together
+
+```
+broker/              generic, transport-agnostic runtime
+  Channel[T]         address + allowed parameter values for payload type T
+  Publish[T]         Subscribe[T]   Request[Req, Resp]   Respond[Req, Resp]
+  Broker             interface: Publish / Request / Subscribe
+broker/natsbroker    Broker on a *nats.Conn
+broker/membroker     in-memory Broker for tests
+```
+
+The generated package contains only plain models, channel definitions, header-name
+constants, parameter helpers and a thin `Client` whose methods each call one generic
+function:
+
+```go
+var OrderCreatedChannel = broker.Channel[Order]{
+	Address: "orders.{region}.created",
+	Allowed: map[string][]string{"region": {"eu", "us"}},
+}
+
+func (c *Client) PublishOrderCreated(ctx context.Context, params broker.Params, msg Order, opts ...broker.MsgOption) error {
+	return broker.Publish(ctx, c.Client, OrderCreatedChannel, params, msg, opts...)
+}
+```
+
+Using it:
 
 ```go
 nc, _ := nats.Connect(nats.DefaultURL)
-c := orders.NewClient(nc, orders.WithErrorHandler(log.Println))
+c := orders.NewClient(natsbroker.New(nc), broker.WithErrorHandler(log.Println))
 
-// receive operation with a NATS `queue` binding → QueueSubscribe on orders.*.created
-c.OnOrderCreated(func(ctx context.Context, p orders.OrderCreatedParams, o orders.Order, h orders.OrderCreatedHeaders) error {
-	log.Printf("order %s in %s", o.ID, p.Region)
+// receive operation with a NATS `queue` binding → queue subscription on orders.*.created
+c.OnOrderCreated(func(ctx context.Context, m broker.Received[orders.Order]) error {
+	log.Printf("order %s in %s", m.Payload.ID, m.Params["region"])
 	return nil
 })
 
-// send operation → Publish on orders.eu.created
-c.PublishOrderCreated(ctx, orders.OrderCreatedParams{Region: "eu"}, order, orders.OrderCreatedHeaders{TraceID: "t-1"})
+// send operation → publish on orders.eu.created
+c.PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), order,
+	broker.WithHeader(orders.OrderCreatedHeaderTraceID, "t-1"))
 
 // send operation with a reply → request/reply
 status, err := c.GetOrderStatus(ctx, orders.StatusRequest{OrderID: "o-1"})
+
+// or skip the wrappers and use the generic functions directly
+broker.Publish(ctx, c.Client, orders.OrderCreatedChannel, orders.OrderCreatedParams("us"), order)
 ```
 
 See [examples/orders](examples/orders) for the full spec and generated code.
 
-## What is generated
+## Mapping
 
 | AsyncAPI | Go |
 |---|---|
 | `components.schemas`, message payloads | structs, enums (typed string constants), aliases |
-| channel `address` with `{params}` | `XxxParams` with `Subject()`, `ParseXxxSubject()`, `XxxSubjectPattern` (`*` wildcards) |
-| `send` operation | publish method |
-| `send` + `reply` | request method returning the typed reply |
-| `receive` operation | subscribe method (uses `QueueSubscribe` when `bindings.nats.queue` is set) |
-| `receive` + `reply` | responder: the handler's return value is sent to the reply inbox |
-| message `headers` | typed headers struct carried in NATS headers |
+| channel `address` with `{params}` | `XxxChannel` (`broker.Channel[T]`) and an `XxxParams(...)` helper; parameter `enum`s become `Allowed` |
+| `send` operation | method calling `broker.Publish` |
+| `send` + `reply` | method calling `broker.Request` |
+| `receive` operation | method calling `broker.Subscribe`, with `broker.Queue` when `bindings.nats.queue` is set |
+| `receive` + `reply` | method calling `broker.Respond` |
+| message `headers` | header-name constants; values are passed with `broker.WithHeader` |
 
 Responder errors are sent back using the `Nats-Service-Error` / `Nats-Service-Error-Code`
-headers and surface as `*RemoteError` on the requesting side.
+headers and surface as `*broker.RemoteError` on the requesting side.
 
 ## Status
 
 Early MVP. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and current limitations
-(one message per operation, no `oneOf`/`allOf`, local `$ref`s only, no JetStream yet).
+(one message type per channel, no `oneOf`/`allOf`, local `$ref`s only, no JetStream yet).
 
 ## Development
 
 ```sh
-go test ./...                        # unit, golden and integration tests (embedded nats-server)
+go test ./...                        # broker, golden and integration tests (embedded nats-server)
 go test ./internal/codegen -update   # refresh golden files after template changes
 ```
 

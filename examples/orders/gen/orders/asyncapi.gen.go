@@ -5,13 +5,9 @@ package orders
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/jnszkr/go-asyncapi/broker"
 )
 
 // LineItem is generated from the AsyncAPI document.
@@ -53,310 +49,64 @@ type StatusRequest struct {
 	OrderID string `json:"orderId"`
 }
 
-// OrderCreatedHeaders are carried in NATS message headers.
-type OrderCreatedHeaders struct {
-	Attempt *int64
-	TraceID string
-}
-
-func (h OrderCreatedHeaders) apply(hdr nats.Header) {
-	if h.Attempt != nil {
-		hdr.Set("attempt", strconv.FormatInt(*h.Attempt, 10))
-	}
-	hdr.Set("traceId", h.TraceID)
-}
-
-func parseOrderCreatedHeaders(hdr nats.Header) (OrderCreatedHeaders, error) {
-	var h OrderCreatedHeaders
-	if v := hdr.Get("attempt"); v != "" {
-		x, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return h, fmt.Errorf("header %s: %w", "attempt", err)
-		}
-		y := int64(x)
-		h.Attempt = &y
-	}
-	if v := hdr.Get("traceId"); v != "" {
-		h.TraceID = v
-	} else {
-		return h, fmt.Errorf("missing required header %s", "traceId")
-	}
-	return h, nil
-}
-
-// OrderCreatedAddress is the channel address of orderCreated.
-// Published whenever an order is placed.
-const OrderCreatedAddress = "orders.{region}.created"
-
-// OrderCreatedSubjectPattern matches every subject of orderCreated.
-const OrderCreatedSubjectPattern = "orders.*.created"
-
-// OrderCreatedParams holds the parameters of orderCreated.
-type OrderCreatedParams struct {
-	// Region the order was placed in.
-	Region string
-}
-
-// Subject returns the concrete subject for these parameters.
-func (p OrderCreatedParams) Subject() (string, error) {
-	if err := validateToken("region", p.Region); err != nil {
-		return "", err
-	}
-	switch p.Region {
-	case "eu", "us":
-	default:
-		return "", fmt.Errorf("parameter %s: %q is not an allowed value", "region", p.Region)
-	}
-	return "orders" + "." + p.Region + "." + "created", nil
-}
-
-// ParseOrderCreatedSubject extracts the parameters of orderCreated from a subject.
-func ParseOrderCreatedSubject(subject string) (OrderCreatedParams, error) {
-	var p OrderCreatedParams
-	tokens := strings.Split(subject, ".")
-	if len(tokens) != 3 {
-		return p, fmt.Errorf("subject %q does not match %s", subject, OrderCreatedAddress)
-	}
-	if tokens[0] != "orders" {
-		return p, fmt.Errorf("subject %q does not match %s", subject, OrderCreatedAddress)
-	}
-	p.Region = tokens[1]
-	if tokens[2] != "created" {
-		return p, fmt.Errorf("subject %q does not match %s", subject, OrderCreatedAddress)
-	}
-	return p, nil
-}
-
-// OrderStatusAddress is the channel address of orderStatus.
-const OrderStatusAddress = "orders.status.get"
-
-// OrderStatusSubject is the NATS subject of orderStatus.
-const OrderStatusSubject = OrderStatusAddress
-
-// Codec encodes and decodes message payloads.
-type Codec interface {
-	// ContentType is sent in the Content-Type header of outgoing messages.
-	ContentType() string
-	Marshal(v any) ([]byte, error)
-	Unmarshal(data []byte, v any) error
-}
-
-// JSONCodec is the default Codec.
-type JSONCodec struct{}
-
-func (JSONCodec) ContentType() string                { return "application/json" }
-func (JSONCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
-func (JSONCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
-
-// Client sends and receives the messages described by the AsyncAPI document
-// over a NATS connection.
-type Client struct {
-	nc             *nats.Conn
-	codec          Codec
-	errorHandler   func(error)
-	requestTimeout time.Duration
-}
-
-// Option configures a Client.
-type Option func(*Client)
-
-// WithCodec replaces the default JSON codec.
-func WithCodec(codec Codec) Option { return func(c *Client) { c.codec = codec } }
-
-// WithErrorHandler sets the function called with errors that occur while
-// handling received messages (decoding failures, handler errors). By default
-// they are discarded.
-func WithErrorHandler(fn func(error)) Option { return func(c *Client) { c.errorHandler = fn } }
-
-// WithRequestTimeout sets the timeout applied to requests whose context has
-// no deadline. The default is 5 seconds.
-func WithRequestTimeout(d time.Duration) Option { return func(c *Client) { c.requestTimeout = d } }
-
-// NewClient returns a Client using the given NATS connection.
-func NewClient(nc *nats.Conn, opts ...Option) *Client {
-	c := &Client{
-		nc:             nc,
-		codec:          JSONCodec{},
-		errorHandler:   func(error) {},
-		requestTimeout: 5 * time.Second,
-	}
-	for _, opt := range opts {
-		opt(c)
-	}
-	return c
-}
-
-// Conn returns the underlying NATS connection.
-func (c *Client) Conn() *nats.Conn { return c.nc }
-
+// Header names.
 const (
-	headerContentType      = "Content-Type"
-	headerServiceError     = "Nats-Service-Error"
-	headerServiceErrorCode = "Nats-Service-Error-Code"
+	OrderCreatedHeaderAttempt = "attempt"
+	OrderCreatedHeaderTraceID = "traceId"
 )
 
-// RemoteError is returned by request methods when the responder reported an error.
-type RemoteError struct {
-	Code        string
-	Description string
+// Channels.
+var (
+	// OrderCreatedChannel is the "orderCreated" channel.
+	// Published whenever an order is placed.
+	OrderCreatedChannel = broker.Channel[Order]{
+		Address: "orders.{region}.created",
+		Allowed: map[string][]string{
+			"region": {"eu", "us"},
+		},
+	}
+	// OrderStatusChannel is the "orderStatus" channel.
+	OrderStatusChannel = broker.Channel[StatusRequest]{
+		Address: "orders.status.get",
+	}
+)
+
+// OrderCreatedParams returns the parameters of OrderCreatedChannel.
+// region: Region the order was placed in.
+func OrderCreatedParams(region string) broker.Params {
+	return broker.Params{"region": region}
 }
 
-func (e *RemoteError) Error() string {
-	if e.Code == "" {
-		return "remote error: " + e.Description
-	}
-	return "remote error " + e.Code + ": " + e.Description
+// Client is a typed client for Order Service. Each method is a
+// thin wrapper around the generic functions of package broker, which can
+// also be called directly with the embedded *broker.Client.
+type Client struct {
+	*broker.Client
 }
 
-func remoteError(m *nats.Msg) error {
-	if m.Header == nil {
-		return nil
-	}
-	if desc := m.Header.Get(headerServiceError); desc != "" {
-		return &RemoteError{Code: m.Header.Get(headerServiceErrorCode), Description: desc}
-	}
-	return nil
-}
-
-func (c *Client) newMsg(subject string, payload any) (*nats.Msg, error) {
-	data, err := c.codec.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s: %w", subject, err)
-	}
-	m := nats.NewMsg(subject)
-	m.Data = data
-	m.Header.Set(headerContentType, c.codec.ContentType())
-	return m, nil
-}
-
-func (c *Client) respondError(m *nats.Msg, code string, err error) {
-	resp := nats.NewMsg(m.Reply)
-	resp.Header.Set(headerServiceError, err.Error())
-	resp.Header.Set(headerServiceErrorCode, code)
-	if rerr := m.RespondMsg(resp); rerr != nil {
-		c.errorHandler(fmt.Errorf("respond to %s: %w", m.Subject, rerr))
-	}
-}
-
-func (c *Client) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(ctx, c.requestTimeout)
-}
-
-// validateToken checks that a channel parameter value is a single, literal
-// NATS subject token.
-func validateToken(name, v string) error {
-	if v == "" {
-		return fmt.Errorf("parameter %s must not be empty", name)
-	}
-	if strings.ContainsAny(v, ".*> \t\r\n") {
-		return fmt.Errorf("parameter %s: %q is not a valid subject token", name, v)
-	}
-	return nil
+// NewClient returns a Client on top of b, e.g. natsbroker.New(nc).
+func NewClient(b broker.Broker, opts ...broker.Option) *Client {
+	return &Client{Client: broker.New(b, opts...)}
 }
 
 // Operation "getOrderStatus": send on orders.status.get.
-func (c *Client) GetOrderStatus(ctx context.Context, req StatusRequest) (StatusReply, error) {
-	var resp StatusReply
-	subject := OrderStatusSubject
-	m, err := c.newMsg(subject, req)
-	if err != nil {
-		return resp, err
-	}
-	ctx, cancel := c.withRequestTimeout(ctx)
-	defer cancel()
-	rm, err := c.nc.RequestMsgWithContext(ctx, m)
-	if err != nil {
-		return resp, fmt.Errorf("request %s: %w", subject, err)
-	}
-	if err := remoteError(rm); err != nil {
-		return resp, err
-	}
-	if err := c.codec.Unmarshal(rm.Data, &resp); err != nil {
-		return resp, fmt.Errorf("decode reply from %s: %w", subject, err)
-	}
-	return resp, nil
+func (c *Client) GetOrderStatus(ctx context.Context, req StatusRequest, opts ...broker.MsgOption) (StatusReply, error) {
+	return broker.Request[StatusRequest, StatusReply](ctx, c.Client, OrderStatusChannel, nil, req, opts...)
 }
-
-// OnOrderCreatedHandler handles messages received by OnOrderCreated.
-type OnOrderCreatedHandler func(ctx context.Context, params OrderCreatedParams, msg Order, headers OrderCreatedHeaders) error
 
 // Process new orders; instances share the work through a queue group.
 //
-// Operation "onOrderCreated": receive on orders.{region}.created (queue group "order-processors").
-func (c *Client) OnOrderCreated(handler OnOrderCreatedHandler) (*nats.Subscription, error) {
-	cb := func(m *nats.Msg) {
-		ctx := context.Background()
-		params, err := ParseOrderCreatedSubject(m.Subject)
-		if err != nil {
-			c.errorHandler(fmt.Errorf("onOrderCreated %s: %w", m.Subject, err))
-			return
-		}
-		var msg Order
-		if err := c.codec.Unmarshal(m.Data, &msg); err != nil {
-			c.errorHandler(fmt.Errorf("onOrderCreated %s: %w", m.Subject, err))
-			return
-		}
-		headers, err := parseOrderCreatedHeaders(m.Header)
-		if err != nil {
-			c.errorHandler(fmt.Errorf("onOrderCreated %s: %w", m.Subject, err))
-			return
-		}
-		if err := handler(ctx, params, msg, headers); err != nil {
-			c.errorHandler(fmt.Errorf("onOrderCreated %s: %w", m.Subject, err))
-		}
-	}
-	return c.nc.QueueSubscribe(OrderCreatedSubjectPattern, "order-processors", cb)
+// Operation "onOrderCreated": receive on orders.{region}.created (queue "order-processors").
+func (c *Client) OnOrderCreated(h broker.Handler[Order], opts ...broker.SubOption) (broker.Subscription, error) {
+	return broker.Subscribe(c.Client, OrderCreatedChannel, h, append([]broker.SubOption{broker.Queue("order-processors")}, opts...)...)
 }
 
 // Operation "publishOrderCreated": send on orders.{region}.created.
-func (c *Client) PublishOrderCreated(ctx context.Context, params OrderCreatedParams, msg Order, headers OrderCreatedHeaders) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	subject, err := params.Subject()
-	if err != nil {
-		return err
-	}
-	m, err := c.newMsg(subject, msg)
-	if err != nil {
-		return err
-	}
-	headers.apply(m.Header)
-	return c.nc.PublishMsg(m)
+func (c *Client) PublishOrderCreated(ctx context.Context, params broker.Params, msg Order, opts ...broker.MsgOption) error {
+	return broker.Publish(ctx, c.Client, OrderCreatedChannel, params, msg, opts...)
 }
 
-// ServeOrderStatusHandler handles requests received by ServeOrderStatus and returns the reply.
-type ServeOrderStatusHandler func(ctx context.Context, msg StatusRequest) (StatusReply, error)
-
-// Operation "serveOrderStatus": receive on orders.status.get (queue group "order-status").
-func (c *Client) ServeOrderStatus(handler ServeOrderStatusHandler) (*nats.Subscription, error) {
-	cb := func(m *nats.Msg) {
-		ctx := context.Background()
-		if m.Reply == "" {
-			c.errorHandler(fmt.Errorf("serveOrderStatus %s: request without reply subject", m.Subject))
-			return
-		}
-		var msg StatusRequest
-		if err := c.codec.Unmarshal(m.Data, &msg); err != nil {
-			c.respondError(m, "400", err)
-			return
-		}
-		resp, err := handler(ctx, msg)
-		if err != nil {
-			c.respondError(m, "500", err)
-			return
-		}
-		rm, err := c.newMsg(m.Reply, resp)
-		if err != nil {
-			c.respondError(m, "500", err)
-			return
-		}
-		if err := m.RespondMsg(rm); err != nil {
-			c.errorHandler(fmt.Errorf("serveOrderStatus %s: respond: %w", m.Subject, err))
-		}
-	}
-	return c.nc.QueueSubscribe(OrderStatusSubject, "order-status", cb)
+// Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").
+func (c *Client) ServeOrderStatus(h broker.Responder[StatusRequest, StatusReply], opts ...broker.SubOption) (broker.Subscription, error) {
+	return broker.Respond(c.Client, OrderStatusChannel, h, append([]broker.SubOption{broker.Queue("order-status")}, opts...)...)
 }
