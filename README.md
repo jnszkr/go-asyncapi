@@ -29,7 +29,9 @@ broker/              generic, transport-agnostic runtime
   Channel[T]         address + allowed parameter values for payload type T
   Publish[T]         Subscribe[T]   Request[Req, Resp]   Respond[Req, Resp]
   Broker             interface: Publish / Request / Subscribe
-broker/natsbroker    Broker on a *nats.Conn
+  Endpoint           subject + queue a receive operation subscribes with
+broker/natsbroker    Broker on a *nats.Conn (core NATS)
+broker/jsbroker      Broker on JetStream, consuming from consumers you create
 broker/membroker     in-memory Broker for tests
 ```
 
@@ -73,6 +75,32 @@ broker.Publish(ctx, c.Client, orders.OrderCreatedChannel, orders.OrderCreatedPar
 
 See [examples/orders](examples/orders) for the full spec and generated code.
 
+### JetStream
+
+The same generated client runs on JetStream through `jsbroker`. Streams and consumers
+are not created for you: their configuration (retention, replicas, ack wait, delivery
+policy, ...) is the application's. Each receive operation gets a generated
+`XxxEndpoint` (`broker.Endpoint{Subject, Queue}`) that you bind a consumer to;
+`jsbroker.ConsumerConfig` turns an endpoint into a starting configuration (filter
+subject, explicit acks, durable named after the queue) that you can adjust:
+
+```go
+js, _ := jetstream.New(nc)
+cons, _ := js.CreateOrUpdateConsumer(ctx, "ORDERS", jsbroker.ConsumerConfig(orders.OnOrderCreatedEndpoint))
+
+b := jsbroker.New(js)
+b.Bind(orders.OnOrderCreatedEndpoint, cons) // or bind a consumer you looked up with js.Consumer
+c := orders.NewClient(b)
+
+c.OnOrderCreated(handle) // consumes from cons
+c.PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), order) // waits for the stream's ack
+```
+
+A handler returning `nil` acks the message, an error naks it (redelivery), and a
+message that cannot be decoded is terminated. Subscribing to an unbound endpoint fails
+with `jsbroker.ErrNotBound`. Request/reply is not stored: `Request` goes over core NATS,
+and responders should use a `natsbroker` client.
+
 ## Mapping
 
 | AsyncAPI | Go |
@@ -91,7 +119,7 @@ headers and surface as `*broker.RemoteError` on the requesting side.
 ## Status
 
 Early MVP. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and current limitations
-(one message type per channel, no `oneOf`/`allOf`, local `$ref`s only, no JetStream yet).
+(one message type per channel, no `oneOf`/`allOf`, local `$ref`s only).
 
 ## Development
 

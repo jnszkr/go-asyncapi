@@ -28,7 +28,7 @@ type sub struct {
 	b       *Broker
 	pattern string
 	queue   string
-	h       func(*broker.Message)
+	h       func(*broker.Message) error
 }
 
 func (s *sub) Unsubscribe() error {
@@ -46,7 +46,9 @@ func (s *sub) Unsubscribe() error {
 // New returns an empty Broker.
 func New() *Broker { return &Broker{next: map[string]int{}} }
 
-func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message)) (broker.Subscription, error) {
+// Subscribe registers h. The error h returns is ignored; there is no
+// redelivery.
+func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message) error) (broker.Subscription, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := &sub{b: b, pattern: subject, queue: queue, h: h}
@@ -56,7 +58,7 @@ func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message)) (brok
 
 func (b *Broker) Publish(_ context.Context, m *broker.Message) error {
 	for _, s := range b.targets(m.Subject) {
-		s.h(clone(m))
+		_ = s.h(clone(m))
 	}
 	return nil
 }
@@ -68,11 +70,12 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 	b.mu.Unlock()
 
 	replies := make(chan *broker.Message, 1)
-	s, _ := b.Subscribe(inbox, "", func(r *broker.Message) {
+	s, _ := b.Subscribe(inbox, "", func(r *broker.Message) error {
 		select {
 		case replies <- r:
 		default:
 		}
+		return nil
 	})
 	defer s.Unsubscribe()
 
