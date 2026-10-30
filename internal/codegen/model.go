@@ -10,8 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// model is the template input: the AsyncAPI document reduced to what the
-// generated NATS client needs.
+// model is the template input: the AsyncAPI document reduced to models,
+// channel definitions and the operations of the thin generated client.
 type model struct {
 	Package  string
 	Title    string
@@ -28,47 +28,45 @@ type channel struct {
 	Key     string // key under #/channels
 	Doc     string
 	Address string
-	Pattern string // address with parameters replaced by "*"
-	Tokens  []subjectToken
+	Payload string // Go type of the messages on this channel
 	Params  []param
 }
 
 func (c *channel) HasParams() bool { return len(c.Params) > 0 }
 
-// subjectToken is one dot-separated token of a subject; either a literal or
-// a parameter.
-type subjectToken struct {
-	Literal string
-	Param   *param
+// HasAllowed reports whether any parameter restricts its values.
+func (c *channel) HasAllowed() bool {
+	for _, p := range c.Params {
+		if len(p.Enum) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type param struct {
-	Name  string // Go field name
-	Key   string // name in the address
-	Doc   string
-	Enum  []string
-	Index int // token position in the subject
+	Arg  string // Go parameter name
+	Key  string // name in the address
+	Doc  string
+	Enum []string
 }
 
 type message struct {
 	Name        string
 	Type        string // Go payload type
-	Headers     *headerDecl
 	ContentType string
 }
 
+// headerDecl lists the header names of a message as constants.
 type headerDecl struct {
-	Name   string
-	Doc    string
-	Fields []headerField
+	Message string
+	Fields  []headerField
 }
 
 type headerField struct {
-	Name     string // Go field name
-	Key      string // NATS header key
-	Type     string // Go type
-	Required bool
-	Doc      string
+	Name string // Go constant name
+	Key  string // header key
+	Doc  string
 }
 
 type operation struct {
@@ -154,6 +152,14 @@ func (b *builder) operation(key string, raw *spec.Operation) (*operation, error)
 	if o.Message, err = b.singleMessage(op.Messages, op.Channel.Ref); err != nil {
 		return nil, err
 	}
+	switch ch.Payload {
+	case "":
+		ch.Payload = o.Message.Type
+	case o.Message.Type:
+	default:
+		// TODO(phase 2): channels carrying several message types.
+		return nil, fmt.Errorf("channel %q carries both %s and %s: one message type per channel is supported", ch.Key, ch.Payload, o.Message.Type)
+	}
 	if op.Reply != nil {
 		reply, _, err := b.doc.ResolveReply(op.Reply)
 		if err != nil {
@@ -210,7 +216,7 @@ func (b *builder) message(ref string) (*message, error) {
 		return nil, fmt.Errorf("message %q payload: %w", name, err)
 	}
 	if msg.Headers != nil {
-		if m.Headers, err = b.headerDecl(msg.Headers, goName+"Headers"); err != nil {
+		if err := b.headerDecl(msg.Headers, goName); err != nil {
 			return nil, fmt.Errorf("message %q headers: %w", name, err)
 		}
 	}
@@ -218,45 +224,25 @@ func (b *builder) message(ref string) (*message, error) {
 	return m, nil
 }
 
-// headerDecl maps an object schema to a struct of primitive fields that is
-// carried in NATS message headers.
-func (b *builder) headerDecl(s *spec.Schema, name string) (*headerDecl, error) {
+// headerDecl records the header names of a message's headers schema.
+func (b *builder) headerDecl(s *spec.Schema, msgName string) error {
 	s, _, err := b.doc.ResolveSchema(s)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if schemaType(s) != "object" {
-		return nil, fmt.Errorf("headers must be an object schema")
+		return fmt.Errorf("headers must be an object schema")
 	}
-	h := &headerDecl{Name: name, Doc: schemaDoc(s)}
-	required := map[string]bool{}
-	for _, r := range s.Required {
-		required[r] = true
-	}
+	h := &headerDecl{Message: msgName}
 	for _, key := range sortedKeys(s.Properties) {
 		ps, _, err := b.doc.ResolveSchema(s.Properties[key])
 		if err != nil {
-			return nil, err
+			return err
 		}
-		var t string
-		switch ps.Type {
-		case "string":
-			t = "string"
-		case "integer":
-			t = "int64"
-		case "number":
-			t = "float64"
-		case "boolean":
-			t = "bool"
-		default:
-			return nil, fmt.Errorf("header %q: only string, integer, number and boolean headers are supported", key)
-		}
-		h.Fields = append(h.Fields, headerField{
-			Name: exportName(key), Key: key, Type: t, Required: required[key], Doc: schemaDoc(ps),
-		})
+		h.Fields = append(h.Fields, headerField{Name: msgName + "Header" + exportName(key), Key: key, Doc: schemaDoc(ps)})
 	}
 	b.headers = append(b.headers, h)
-	return h, nil
+	return nil
 }
 
 func (b *builder) channel(ref string) (*channel, error) {
@@ -276,8 +262,7 @@ func (b *builder) channel(ref string) (*channel, error) {
 		Doc:     firstNonEmpty(ch.Description, ch.Summary, ch.Title),
 		Address: *ch.Address,
 	}
-	var pattern []string
-	for i, tok := range strings.Split(c.Address, ".") {
+	for tok := range strings.SplitSeq(c.Address, ".") {
 		if tok == "" {
 			return nil, fmt.Errorf("channel %q: empty token in subject %q", key, c.Address)
 		}
@@ -286,15 +271,13 @@ func (b *builder) channel(ref string) (*channel, error) {
 			if strings.ContainsAny(tok, "*> \t") {
 				return nil, fmt.Errorf("channel %q: wildcards in addresses are not supported, use parameters", key)
 			}
-			c.Tokens = append(c.Tokens, subjectToken{Literal: tok})
-			pattern = append(pattern, tok)
 			continue
 		}
 		if len(sm) > 1 || sm[0][0] != 0 || sm[0][1] != len(tok) {
 			return nil, fmt.Errorf("channel %q: parameter must span a whole subject token, got %q", key, tok)
 		}
 		pkey := tok[sm[0][2]:sm[0][3]]
-		p := param{Name: exportName(pkey), Key: pkey, Index: i}
+		p := param{Arg: argName(pkey), Key: pkey}
 		if raw, ok := ch.Parameters[pkey]; ok {
 			def, _, err := b.doc.ResolveParameter(raw)
 			if err != nil {
@@ -303,17 +286,7 @@ func (b *builder) channel(ref string) (*channel, error) {
 			p.Doc, p.Enum = def.Description, def.Enum
 		}
 		c.Params = append(c.Params, p)
-		c.Tokens = append(c.Tokens, subjectToken{Param: &c.Params[len(c.Params)-1]})
-		pattern = append(pattern, "*")
 	}
-	// c.Params may have been reallocated; re-point tokens at the final slice.
-	for i, j := 0, 0; i < len(c.Tokens); i++ {
-		if c.Tokens[i].Param != nil {
-			c.Tokens[i].Param = &c.Params[j]
-			j++
-		}
-	}
-	c.Pattern = strings.Join(pattern, ".")
 	b.channels[key] = c
 	return c, nil
 }

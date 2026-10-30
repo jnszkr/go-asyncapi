@@ -77,9 +77,9 @@ operations:
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`const PingSubject = PingAddress`,
+		`PingChannel = broker.Channel[Ping]{`,
 		`type Ping = string`,
-		`c.nc.Subscribe(PingSubject, cb)`,
+		`return broker.Subscribe(c.Client, PingChannel, h, opts...)`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("generated code does not contain %q:\n%s", want, out)

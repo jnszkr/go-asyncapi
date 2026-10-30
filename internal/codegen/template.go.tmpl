@@ -10,150 +10,92 @@ import (
 	"{{.}}"
 {{- end}}
 
-	"github.com/nats-io/nats.go"
+	"github.com/jnszkr/go-asyncapi/broker"
 )
 {{range .Types}}
 {{- template "type" .}}
 {{end}}
-{{- range .Headers}}
-{{template "headers" .}}
-{{end}}
-{{- range .Channels}}
-{{template "channel" .}}
-{{end}}
-// Codec encodes and decodes message payloads.
-type Codec interface {
-	// ContentType is sent in the Content-Type header of outgoing messages.
-	ContentType() string
-	Marshal(v any) ([]byte, error)
-	Unmarshal(data []byte, v any) error
-}
-
-// JSONCodec is the default Codec.
-type JSONCodec struct{}
-
-func (JSONCodec) ContentType() string                { return "application/json" }
-func (JSONCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
-func (JSONCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
-
-// Client sends and receives the messages described by the AsyncAPI document
-// over a NATS connection.
-type Client struct {
-	nc             *nats.Conn
-	codec          Codec
-	errorHandler   func(error)
-	requestTimeout time.Duration
-}
-
-// Option configures a Client.
-type Option func(*Client)
-
-// WithCodec replaces the default JSON codec.
-func WithCodec(codec Codec) Option { return func(c *Client) { c.codec = codec } }
-
-// WithErrorHandler sets the function called with errors that occur while
-// handling received messages (decoding failures, handler errors). By default
-// they are discarded.
-func WithErrorHandler(fn func(error)) Option { return func(c *Client) { c.errorHandler = fn } }
-
-// WithRequestTimeout sets the timeout applied to requests whose context has
-// no deadline. The default is 5 seconds.
-func WithRequestTimeout(d time.Duration) Option { return func(c *Client) { c.requestTimeout = d } }
-
-// NewClient returns a Client using the given NATS connection.
-func NewClient(nc *nats.Conn, opts ...Option) *Client {
-	c := &Client{
-		nc:             nc,
-		codec:          JSONCodec{},
-		errorHandler:   func(error) {},
-		requestTimeout: 5 * time.Second,
-	}
-	for _, opt := range opts {
-		opt(c)
-	}
-	return c
-}
-
-// Conn returns the underlying NATS connection.
-func (c *Client) Conn() *nats.Conn { return c.nc }
-
+{{- if .Headers}}
+// Header names.
 const (
-	headerContentType      = "Content-Type"
-	headerServiceError     = "Nats-Service-Error"
-	headerServiceErrorCode = "Nats-Service-Error-Code"
+{{- range .Headers}}{{range .Fields}}
+{{- if .Doc}}{{template "doc" .Doc}}{{end}}
+	{{.Name}} = {{printf "%q" .Key}}
+{{- end}}{{end}}
 )
-
-// RemoteError is returned by request methods when the responder reported an error.
-type RemoteError struct {
-	Code        string
-	Description string
+{{end}}
+{{- if .Channels}}
+// Channels.
+var (
+{{- range .Channels}}
+	// {{.Name}}Channel is the {{printf "%q" .Key}} channel.
+{{- template "doc" .Doc}}
+	{{.Name}}Channel = broker.Channel[{{.Payload}}]{
+		Address: {{printf "%q" .Address}},
+{{- if .HasAllowed}}
+		Allowed: map[string][]string{
+{{- range .Params}}{{if .Enum}}
+			{{printf "%q" .Key}}: { {{- range $i, $v := .Enum}}{{if $i}}, {{end}}{{printf "%q" $v}}{{end -}} },
+{{- end}}{{end}}
+		},
+{{- end}}
+	}
+{{- end}}
+)
+{{end}}
+{{- range .Channels}}{{if .HasParams}}
+// {{.Name}}Params returns the parameters of {{.Name}}Channel.
+{{- range .Params}}{{if .Doc}}
+// {{.Arg}}: {{.Doc}}{{end}}{{end}}
+func {{.Name}}Params({{range $i, $p := .Params}}{{if $i}}, {{end}}{{$p.Arg}}{{end}} string) broker.Params {
+	return broker.Params{ {{- range $i, $p := .Params}}{{if $i}}, {{end}}{{printf "%q" $p.Key}}: {{$p.Arg}}{{end -}} }
+}
+{{end}}{{end}}
+// Client is a typed client for {{if .Title}}{{.Title}}{{else}}the AsyncAPI document{{end}}. Each method is a
+// thin wrapper around the generic functions of package broker, which can
+// also be called directly with the embedded *broker.Client.
+type Client struct {
+	*broker.Client
 }
 
-func (e *RemoteError) Error() string {
-	if e.Code == "" {
-		return "remote error: " + e.Description
-	}
-	return "remote error " + e.Code + ": " + e.Description
-}
-
-func remoteError(m *nats.Msg) error {
-	if m.Header == nil {
-		return nil
-	}
-	if desc := m.Header.Get(headerServiceError); desc != "" {
-		return &RemoteError{Code: m.Header.Get(headerServiceErrorCode), Description: desc}
-	}
-	return nil
-}
-
-func (c *Client) newMsg(subject string, payload any) (*nats.Msg, error) {
-	data, err := c.codec.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s: %w", subject, err)
-	}
-	m := nats.NewMsg(subject)
-	m.Data = data
-	m.Header.Set(headerContentType, c.codec.ContentType())
-	return m, nil
-}
-
-func (c *Client) respondError(m *nats.Msg, code string, err error) {
-	resp := nats.NewMsg(m.Reply)
-	resp.Header.Set(headerServiceError, err.Error())
-	resp.Header.Set(headerServiceErrorCode, code)
-	if rerr := m.RespondMsg(resp); rerr != nil {
-		c.errorHandler(fmt.Errorf("respond to %s: %w", m.Subject, rerr))
-	}
-}
-
-func (c *Client) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(ctx, c.requestTimeout)
-}
-
-// validateToken checks that a channel parameter value is a single, literal
-// NATS subject token.
-func validateToken(name, v string) error {
-	if v == "" {
-		return fmt.Errorf("parameter %s must not be empty", name)
-	}
-	if strings.ContainsAny(v, ".*> \t\r\n") {
-		return fmt.Errorf("parameter %s: %q is not a valid subject token", name, v)
-	}
-	return nil
+// NewClient returns a Client on top of b, e.g. natsbroker.New(nc).
+func NewClient(b broker.Broker, opts ...broker.Option) *Client {
+	return &Client{Client: broker.New(b, opts...)}
 }
 {{range .Ops}}
-{{if and .IsSend (not .Reply)}}{{template "publish" .}}
-{{- else if .IsSend}}{{template "request" .}}
-{{- else if not .Reply}}{{template "subscribe" .}}
-{{- else}}{{template "respond" .}}
+{{template "opdoc" .}}
+{{- if and .IsSend (not .Reply)}}
+func (c *Client) {{.Name}}(ctx context.Context, {{template "params" .}}msg {{.Message.Type}}, opts ...broker.MsgOption) error {
+	return broker.Publish(ctx, c.Client, {{.Channel.Name}}Channel, {{template "paramsArg" .}}, msg, opts...)
+}
+{{- else if .IsSend}}
+func (c *Client) {{.Name}}(ctx context.Context, {{template "params" .}}req {{.Message.Type}}, opts ...broker.MsgOption) ({{.Reply.Type}}, error) {
+	return broker.Request[{{.Message.Type}}, {{.Reply.Type}}](ctx, c.Client, {{.Channel.Name}}Channel, {{template "paramsArg" .}}, req, opts...)
+}
+{{- else if not .Reply}}
+func (c *Client) {{.Name}}(h broker.Handler[{{.Message.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
+	return broker.Subscribe(c.Client, {{.Channel.Name}}Channel, h, {{template "subOpts" .}})
+}
+{{- else}}
+func (c *Client) {{.Name}}(h broker.Responder[{{.Message.Type}}, {{.Reply.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
+	return broker.Respond(c.Client, {{.Channel.Name}}Channel, h, {{template "subOpts" .}})
+}
 {{- end}}
 {{end}}
 
+{{- define "params"}}{{if .Channel.HasParams}}params broker.Params, {{end}}{{end}}
+{{- define "paramsArg"}}{{if .Channel.HasParams}}params{{else}}nil{{end}}{{end}}
+{{- define "subOpts"}}{{if .Queue}}append([]broker.SubOption{broker.Queue({{printf "%q" .Queue}})}, opts...)...{{else}}opts...{{end}}{{end}}
+
 {{- define "doc"}}{{if .}}{{range lines .}}
 // {{.}}{{end}}{{end}}{{end}}
+
+{{- define "opdoc"}}
+{{- if .Doc}}{{template "doc" .Doc}}
+//{{end}}
+// Operation {{printf "%q" .Key}}: {{.Action}} on {{.Channel.Address}}
+{{- if .Queue}} (queue {{printf "%q" .Queue}}){{end}}.
+{{- end}}
 
 {{- define "type"}}
 {{- if .Doc}}{{template "doc" .Doc}}{{else}}
@@ -177,256 +119,4 @@ const (
 {{- else}}
 type {{.Name}} = {{.Under}}
 {{- end}}
-{{- end}}
-
-{{- define "headers"}}
-{{- if .Doc}}{{template "doc" .Doc}}{{else}}
-// {{.Name}} are carried in NATS message headers.{{end}}
-type {{.Name}} struct {
-{{- range .Fields}}
-{{- if .Doc}}{{template "doc" .Doc}}{{end}}
-	{{.Name}} {{if not .Required}}*{{end}}{{.Type}}
-{{- end}}
-}
-
-func (h {{.Name}}) apply(hdr nats.Header) {
-{{- range .Fields}}
-{{- if .Required}}
-	hdr.Set({{printf "%q" .Key}}, {{formatHeader .Type (printf "h.%s" .Name)}})
-{{- else}}
-	if h.{{.Name}} != nil {
-		hdr.Set({{printf "%q" .Key}}, {{formatHeader .Type (printf "*h.%s" .Name)}})
-	}
-{{- end}}
-{{- end}}
-}
-
-func parse{{.Name}}(hdr nats.Header) ({{.Name}}, error) {
-	var h {{.Name}}
-{{- range .Fields}}
-	if v := hdr.Get({{printf "%q" .Key}}); v != "" {
-{{- if eq .Type "string"}}
-		h.{{.Name}} = {{if not .Required}}&{{end}}v
-{{- else}}
-		x, err := {{parseHeader .Type "v"}}
-		if err != nil {
-			return h, fmt.Errorf("header %s: %w", {{printf "%q" .Key}}, err)
-		}
-		y := {{.Type}}(x)
-		h.{{.Name}} = {{if not .Required}}&{{end}}y
-{{- end}}
-	}{{if .Required}} else {
-		return h, fmt.Errorf("missing required header %s", {{printf "%q" .Key}})
-	}{{end}}
-{{- end}}
-	return h, nil
-}
-{{- end}}
-
-{{- define "channel"}}
-// {{.Name}}Address is the channel address of {{.Key}}.
-{{- template "doc" .Doc}}
-const {{.Name}}Address = {{printf "%q" .Address}}
-{{if .HasParams}}
-// {{.Name}}SubjectPattern matches every subject of {{.Key}}.
-const {{.Name}}SubjectPattern = {{printf "%q" .Pattern}}
-
-// {{.Name}}Params holds the parameters of {{.Key}}.
-type {{.Name}}Params struct {
-{{- range .Params}}
-{{- if .Doc}}{{template "doc" .Doc}}{{end}}
-	{{.Name}} string
-{{- end}}
-}
-
-// Subject returns the concrete subject for these parameters.
-func (p {{.Name}}Params) Subject() (string, error) {
-{{- range .Params}}
-	if err := validateToken({{printf "%q" .Key}}, p.{{.Name}}); err != nil {
-		return "", err
-	}
-{{- if .Enum}}
-	switch p.{{.Name}} {
-	case {{range $i, $v := .Enum}}{{if $i}}, {{end}}{{printf "%q" $v}}{{end}}:
-	default:
-		return "", fmt.Errorf("parameter %s: %q is not an allowed value", {{printf "%q" .Key}}, p.{{.Name}})
-	}
-{{- end}}
-{{- end}}
-	return {{range $i, $t := .Tokens}}{{if $i}} + "." + {{end}}{{if $t.Param}}p.{{$t.Param.Name}}{{else}}{{printf "%q" $t.Literal}}{{end}}{{end}}, nil
-}
-
-// Parse{{.Name}}Subject extracts the parameters of {{.Key}} from a subject.
-func Parse{{.Name}}Subject(subject string) ({{.Name}}Params, error) {
-	var p {{.Name}}Params
-	tokens := strings.Split(subject, ".")
-	if len(tokens) != {{len .Tokens}} {
-		return p, fmt.Errorf("subject %q does not match %s", subject, {{.Name}}Address)
-	}
-{{- range $i, $t := .Tokens}}
-{{- if $t.Param}}
-	p.{{$t.Param.Name}} = tokens[{{$i}}]
-{{- else}}
-	if tokens[{{$i}}] != {{printf "%q" $t.Literal}} {
-		return p, fmt.Errorf("subject %q does not match %s", subject, {{$.Name}}Address)
-	}
-{{- end}}
-{{- end}}
-	return p, nil
-}
-{{- else}}
-// {{.Name}}Subject is the NATS subject of {{.Key}}.
-const {{.Name}}Subject = {{.Name}}Address
-{{- end}}
-{{- end}}
-
-{{- define "opdoc"}}
-{{- if .Doc}}{{template "doc" .Doc}}
-//{{end}}
-// Operation {{printf "%q" .Key}}: {{.Action}} on {{.Channel.Address}}
-{{- if .Queue}} (queue group {{printf "%q" .Queue}}){{end}}.
-{{- end}}
-
-{{- define "publish"}}
-{{- template "opdoc" .}}
-func (c *Client) {{.Name}}(ctx context.Context, {{if .Channel.HasParams}}params {{.Channel.Name}}Params, {{end}}msg {{.Message.Type}}{{if .Message.Headers}}, headers {{.Message.Headers.Name}}{{end}}) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-{{- if .Channel.HasParams}}
-	subject, err := params.Subject()
-	if err != nil {
-		return err
-	}
-{{- else}}
-	subject := {{.Channel.Name}}Subject
-{{- end}}
-	m, err := c.newMsg(subject, msg)
-	if err != nil {
-		return err
-	}
-{{- if .Message.Headers}}
-	headers.apply(m.Header)
-{{- end}}
-	return c.nc.PublishMsg(m)
-}
-{{- end}}
-
-{{- define "request"}}
-{{- template "opdoc" .}}
-func (c *Client) {{.Name}}(ctx context.Context, {{if .Channel.HasParams}}params {{.Channel.Name}}Params, {{end}}req {{.Message.Type}}{{if .Message.Headers}}, headers {{.Message.Headers.Name}}{{end}}) ({{.Reply.Type}}, error) {
-	var resp {{.Reply.Type}}
-{{- if .Channel.HasParams}}
-	subject, err := params.Subject()
-	if err != nil {
-		return resp, err
-	}
-{{- else}}
-	subject := {{.Channel.Name}}Subject
-{{- end}}
-	m, err := c.newMsg(subject, req)
-	if err != nil {
-		return resp, err
-	}
-{{- if .Message.Headers}}
-	headers.apply(m.Header)
-{{- end}}
-	ctx, cancel := c.withRequestTimeout(ctx)
-	defer cancel()
-	rm, err := c.nc.RequestMsgWithContext(ctx, m)
-	if err != nil {
-		return resp, fmt.Errorf("request %s: %w", subject, err)
-	}
-	if err := remoteError(rm); err != nil {
-		return resp, err
-	}
-	if err := c.codec.Unmarshal(rm.Data, &resp); err != nil {
-		return resp, fmt.Errorf("decode reply from %s: %w", subject, err)
-	}
-	return resp, nil
-}
-{{- end}}
-
-{{- define "handlerArgs"}}ctx context.Context, {{if .Channel.HasParams}}params {{.Channel.Name}}Params, {{end}}msg {{.Message.Type}}{{if .Message.Headers}}, headers {{.Message.Headers.Name}}{{end}}{{end}}
-{{- define "handlerCall"}}ctx, {{if .Channel.HasParams}}params, {{end}}msg{{if .Message.Headers}}, headers{{end}}{{end}}
-
-{{- define "subscribeCall"}}
-{{- if .Channel.HasParams}}{{$s := printf "%sSubjectPattern" .Channel.Name}}
-{{- if .Queue}}
-	return c.nc.QueueSubscribe({{$s}}, {{printf "%q" .Queue}}, cb)
-{{- else}}
-	return c.nc.Subscribe({{$s}}, cb)
-{{- end}}
-{{- else}}{{$s := printf "%sSubject" .Channel.Name}}
-{{- if .Queue}}
-	return c.nc.QueueSubscribe({{$s}}, {{printf "%q" .Queue}}, cb)
-{{- else}}
-	return c.nc.Subscribe({{$s}}, cb)
-{{- end}}
-{{- end}}
-{{- end}}
-
-{{- define "decode"}}
-{{- if .Channel.HasParams}}
-		params, err := Parse{{.Channel.Name}}Subject(m.Subject)
-		if err != nil {
-			{{fail .}}
-		}
-{{- end}}
-		var msg {{.Message.Type}}
-		if err := c.codec.Unmarshal(m.Data, &msg); err != nil {
-			{{fail .}}
-		}
-{{- if .Message.Headers}}
-		headers, err := parse{{.Message.Headers.Name}}(m.Header)
-		if err != nil {
-			{{fail .}}
-		}
-{{- end}}
-{{- end}}
-
-{{- define "subscribe"}}
-// {{.Name}}Handler handles messages received by {{.Name}}.
-type {{.Name}}Handler func({{template "handlerArgs" .}}) error
-{{template "opdoc" .}}
-func (c *Client) {{.Name}}(handler {{.Name}}Handler) (*nats.Subscription, error) {
-	cb := func(m *nats.Msg) {
-		ctx := context.Background()
-{{- template "decode" .}}
-		if err := handler({{template "handlerCall" .}}); err != nil {
-			c.errorHandler(fmt.Errorf("{{.Key}} %s: %w", m.Subject, err))
-		}
-	}
-{{- template "subscribeCall" .}}
-}
-{{- end}}
-
-{{- define "respond"}}
-// {{.Name}}Handler handles requests received by {{.Name}} and returns the reply.
-type {{.Name}}Handler func({{template "handlerArgs" .}}) ({{.Reply.Type}}, error)
-{{template "opdoc" .}}
-func (c *Client) {{.Name}}(handler {{.Name}}Handler) (*nats.Subscription, error) {
-	cb := func(m *nats.Msg) {
-		ctx := context.Background()
-		if m.Reply == "" {
-			c.errorHandler(fmt.Errorf("{{.Key}} %s: request without reply subject", m.Subject))
-			return
-		}
-{{- template "decode" .}}
-		resp, err := handler({{template "handlerCall" .}})
-		if err != nil {
-			c.respondError(m, "500", err)
-			return
-		}
-		rm, err := c.newMsg(m.Reply, resp)
-		if err != nil {
-			c.respondError(m, "500", err)
-			return
-		}
-		if err := m.RespondMsg(rm); err != nil {
-			c.errorHandler(fmt.Errorf("{{.Key}} %s: respond: %w", m.Subject, err))
-		}
-	}
-{{- template "subscribeCall" .}}
-}
 {{- end}}
