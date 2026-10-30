@@ -1,0 +1,44 @@
+name: Release
+
+# Every push to main is versioned from its Conventional Commits:
+# fix → patch, feat → minor, "!" / BREAKING CHANGE → major (minor while < 1.0.0).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+
+      - id: semrel
+        uses: go-semantic-release/action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          allow-initial-development-versions: true
+
+      # The tag above is pushed with GITHUB_TOKEN, which does not trigger
+      # other workflows, so binaries are built here.
+      - if: steps.semrel.outputs.version != ''
+        run: git fetch --tags --force
+      - if: steps.semrel.outputs.version != ''
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

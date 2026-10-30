@@ -60,7 +60,7 @@ examples/             sample specs + checked-in generated output (also golden fi
 3. **JetStream** (outside the binding spec, opt-in via `x-` extensions)
    - Stream/consumer config, `js.Publish`, pull/push consumers, acks
 4. **Polish**
-   - `go generate` friendly, `go install`able release binaries, docs site, more examples
+   - Docs site, more examples (versioned releases with binaries are automated from `main`)
 
 ## Non-goals / constraints
 
