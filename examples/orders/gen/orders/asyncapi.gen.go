@@ -71,6 +71,14 @@ var (
 	}
 )
 
+// Endpoints of the receive operations: the subject and queue each one
+// subscribes with, e.g. to create or bind JetStream consumers (see
+// jsbroker.ConsumerConfig and jsbroker.Broker.Bind).
+var (
+	OnOrderCreatedEndpoint   = broker.Endpoint{Subject: "orders.*.created", Queue: "order-processors"}
+	ServeOrderStatusEndpoint = broker.Endpoint{Subject: "orders.status.get", Queue: "order-status"}
+)
+
 // OrderCreatedParams returns the parameters of OrderCreatedChannel.
 // region: Region the order was placed in.
 func OrderCreatedParams(region string) broker.Params {

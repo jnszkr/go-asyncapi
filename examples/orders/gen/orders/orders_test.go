@@ -7,10 +7,12 @@ import (
 	"time"
 
 	"github.com/jnszkr/go-asyncapi/broker"
+	"github.com/jnszkr/go-asyncapi/broker/jsbroker"
 	"github.com/jnszkr/go-asyncapi/broker/natsbroker"
 	"github.com/jnszkr/go-asyncapi/examples/orders/gen/orders"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 func connect(t *testing.T) *nats.Conn {
@@ -141,5 +143,63 @@ func TestGenericCallsWork(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out")
+	}
+}
+
+// TestJetStream runs the same generated client on JetStream. The stream and
+// consumer are the application's; the generated endpoint only says which
+// subject and queue the operation subscribes with.
+func TestJetStream(t *testing.T) {
+	opts := natstest.DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	opts.StoreDir = t.TempDir()
+	srv := natstest.RunServer(&opts)
+	t.Cleanup(srv.Shutdown)
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{Name: "ORDERS", Subjects: []string{orders.OrderCreatedChannel.Pattern()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jsbroker.ConsumerConfig(orders.OnOrderCreatedEndpoint))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := jsbroker.New(js)
+	b.Bind(orders.OnOrderCreatedEndpoint, cons)
+	c := orders.NewClient(b)
+
+	// Published before anyone subscribes: the stream keeps it.
+	if err := c.PublishOrderCreated(ctx, orders.OrderCreatedParams("us"), orders.Order{ID: "o-3"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(chan broker.Received[orders.Order], 1)
+	sub, err := c.OnOrderCreated(func(_ context.Context, m broker.Received[orders.Order]) error {
+		got <- m
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	select {
+	case m := <-got:
+		if m.Payload.ID != "o-3" || m.Params["region"] != "us" {
+			t.Errorf("received %+v", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for stored message")
 	}
 }

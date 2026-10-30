@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -62,6 +63,11 @@ const (
 	HeaderServiceError     = "Nats-Service-Error"
 	HeaderServiceErrorCode = "Nats-Service-Error-Code"
 )
+
+// ErrMalformed wraps errors about messages that can never be handled, such
+// as undecodable payloads or subjects that don't match the channel. Brokers
+// with redelivery drop these instead of retrying them.
+var ErrMalformed = errors.New("malformed message")
 
 // RemoteError is returned by Request when the responder reported an error.
 type RemoteError struct {
@@ -140,45 +146,48 @@ func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p P
 
 // Subscribe calls h for every message on ch, across all parameter values.
 func Subscribe[T any](c *Client, ch Channel[T], h Handler[T], opts ...SubOption) (Subscription, error) {
-	return c.subscribe(ch.Pattern(), opts, func(m *Message) {
+	return c.subscribe(ch.Pattern(), opts, func(m *Message) error {
 		r, err := decode(c, ch, m)
 		if err == nil {
 			err = h(context.Background(), r)
 		}
 		if err != nil {
-			c.onError(fmt.Errorf("%s: %w", m.Subject, err))
+			err = fmt.Errorf("%s: %w", m.Subject, err)
+			c.onError(err)
 		}
+		return err
 	})
 }
 
 // Respond answers requests on ch with the value returned by h. Errors are
 // sent back to the requester, which receives them as *RemoteError.
 func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], opts ...SubOption) (Subscription, error) {
-	return c.subscribe(ch.Pattern(), opts, func(m *Message) {
+	return c.subscribe(ch.Pattern(), opts, func(m *Message) error {
 		if m.Reply == "" {
-			c.onError(fmt.Errorf("%s: request without reply subject", m.Subject))
-			return
+			err := fmt.Errorf("%s: %w: request without reply subject", m.Subject, ErrMalformed)
+			c.onError(err)
+			return err
 		}
 		r, err := decode(c, ch, m)
 		if err != nil {
-			c.respondError(m, "400", err)
-			return
+			return c.respondError(m, "400", err)
 		}
 		resp, err := h(context.Background(), r)
 		if err != nil {
-			c.respondError(m, "500", err)
-			return
+			return c.respondError(m, "500", err)
 		}
 		data, err := c.codec.Marshal(resp)
 		if err != nil {
-			c.respondError(m, "500", err)
-			return
+			return c.respondError(m, "500", err)
 		}
 		reply := &Message{Subject: m.Reply, Header: Header{}, Data: data}
 		reply.Header.Set(HeaderContentType, c.codec.ContentType())
 		if err := c.broker.Publish(context.Background(), reply); err != nil {
-			c.onError(fmt.Errorf("%s: respond: %w", m.Subject, err))
+			err = fmt.Errorf("%s: respond: %w", m.Subject, err)
+			c.onError(err)
+			return err
 		}
+		return nil
 	})
 }
 
@@ -211,15 +220,15 @@ func decode[T any](c *Client, ch Channel[T], m *Message) (Received[T], error) {
 	}
 	var err error
 	if r.Params, err = ch.ParseSubject(m.Subject); err != nil {
-		return r, err
+		return r, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	if err := c.codec.Unmarshal(m.Data, &r.Payload); err != nil {
-		return r, fmt.Errorf("decode: %w", err)
+		return r, fmt.Errorf("%w: decode: %w", ErrMalformed, err)
 	}
 	return r, nil
 }
 
-func (c *Client) subscribe(subject string, opts []SubOption, h func(*Message)) (Subscription, error) {
+func (c *Client) subscribe(subject string, opts []SubOption, h func(*Message) error) (Subscription, error) {
 	var cfg subConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -227,11 +236,16 @@ func (c *Client) subscribe(subject string, opts []SubOption, h func(*Message)) (
 	return c.broker.Subscribe(subject, cfg.queue, h)
 }
 
-func (c *Client) respondError(m *Message, code string, err error) {
+// respondError sends err back to the requester. The request counts as
+// handled once the error reply is sent.
+func (c *Client) respondError(m *Message, code string, err error) error {
 	reply := &Message{Subject: m.Reply, Header: Header{}}
 	reply.Header.Set(HeaderServiceError, err.Error())
 	reply.Header.Set(HeaderServiceErrorCode, code)
 	if perr := c.broker.Publish(context.Background(), reply); perr != nil {
-		c.onError(fmt.Errorf("%s: respond: %w", m.Subject, perr))
+		perr = fmt.Errorf("%s: respond: %w", m.Subject, perr)
+		c.onError(perr)
+		return perr
 	}
+	return nil
 }

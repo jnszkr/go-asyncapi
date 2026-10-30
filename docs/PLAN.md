@@ -61,8 +61,12 @@ examples/             sample specs + checked-in generated output (also golden fi
    - `oneOf` / `anyOf` / `allOf` schemas
    - AsyncAPI 2.6 input (publish/subscribe semantics inverted vs 3.0)
    - External file `$ref`s
-3. **JetStream** (outside the binding spec, opt-in via `x-` extensions)
-   - Stream/consumer config, `js.Publish`, pull/push consumers, acks
+3. **JetStream** (outside the binding spec)
+   - Done: `broker/jsbroker` publishes with stream acks and consumes from pull consumers
+     the application creates and binds to generated `broker.Endpoint`s; handler errors
+     nak, malformed messages are terminated
+   - Open: push consumers, per-message ack control (in progress, delay), generating
+     stream/consumer hints from `x-` extensions
 4. **Polish**
    - Docs site, more examples (versioned releases with binaries are automated from `main`)
 

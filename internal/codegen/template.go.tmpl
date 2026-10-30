@@ -43,6 +43,16 @@ var (
 {{- end}}
 )
 {{end}}
+{{- if .HasReceive}}
+// Endpoints of the receive operations: the subject and queue each one
+// subscribes with, e.g. to create or bind JetStream consumers (see
+// jsbroker.ConsumerConfig and jsbroker.Broker.Bind).
+var (
+{{- range .Ops}}{{if not .IsSend}}
+	{{.Name}}Endpoint = broker.Endpoint{Subject: {{printf "%q" .Channel.Pattern}}{{if .Queue}}, Queue: {{printf "%q" .Queue}}{{end}}}
+{{- end}}{{end}}
+)
+{{end}}
 {{- range .Channels}}{{if .HasParams}}
 // {{.Name}}Params returns the parameters of {{.Name}}Channel.
 {{- range .Params}}{{if .Doc}}
