@@ -1,0 +1,133 @@
+asyncapi: 3.0.0
+info:
+  title: Order Service
+  version: 1.0.0
+  description: Example order service used to exercise the NATS generator.
+defaultContentType: application/json
+
+servers:
+  local:
+    host: localhost:4222
+    protocol: nats
+
+channels:
+  orderCreated:
+    address: orders.{region}.created
+    description: Published whenever an order is placed.
+    parameters:
+      region:
+        enum: [eu, us]
+        description: Region the order was placed in.
+    messages:
+      orderCreated:
+        $ref: '#/components/messages/OrderCreated'
+  orderStatus:
+    address: orders.status.get
+    messages:
+      statusRequest:
+        $ref: '#/components/messages/StatusRequest'
+  orderStatusReply:
+    address: null
+    messages:
+      statusReply:
+        $ref: '#/components/messages/StatusReply'
+
+operations:
+  publishOrderCreated:
+    action: send
+    channel:
+      $ref: '#/channels/orderCreated'
+  onOrderCreated:
+    action: receive
+    summary: Process new orders; instances share the work through a queue group.
+    channel:
+      $ref: '#/channels/orderCreated'
+    bindings:
+      nats:
+        queue: order-processors
+        bindingVersion: 0.1.0
+  getOrderStatus:
+    action: send
+    channel:
+      $ref: '#/channels/orderStatus'
+    reply:
+      channel:
+        $ref: '#/channels/orderStatusReply'
+  serveOrderStatus:
+    action: receive
+    channel:
+      $ref: '#/channels/orderStatus'
+    reply:
+      channel:
+        $ref: '#/channels/orderStatusReply'
+    bindings:
+      nats:
+        queue: order-status
+
+components:
+  messages:
+    OrderCreated:
+      name: OrderCreated
+      headers:
+        type: object
+        required: [traceId]
+        properties:
+          traceId:
+            type: string
+          attempt:
+            type: integer
+      payload:
+        $ref: '#/components/schemas/Order'
+    StatusRequest:
+      payload:
+        type: object
+        required: [orderId]
+        properties:
+          orderId:
+            type: string
+    StatusReply:
+      payload:
+        type: object
+        required: [orderId, status]
+        properties:
+          orderId:
+            type: string
+          status:
+            $ref: '#/components/schemas/OrderStatus'
+          updatedAt:
+            type: string
+            format: date-time
+  schemas:
+    Order:
+      type: object
+      required: [id, items, status]
+      properties:
+        id:
+          type: string
+          description: Unique order identifier.
+        customerEmail:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LineItem'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total:
+          type: number
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+    LineItem:
+      type: object
+      required: [sku, quantity]
+      properties:
+        sku:
+          type: string
+        quantity:
+          type: integer
+          format: int32
+    OrderStatus:
+      type: string
+      enum: [pending, paid, shipped, cancelled]
