@@ -69,3 +69,17 @@ Early MVP. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and current limitati
 go test ./...                        # unit, golden and integration tests (embedded nats-server)
 go test ./internal/codegen -update   # refresh golden files after template changes
 ```
+
+## Contributing
+
+Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat: …`, `fix: …`, `docs: …`, `ci: …`, `feat!: …` for breaking changes). PRs are
+squash-merged, so the PR title becomes the commit on `main`; CI checks it.
+
+## Releases
+
+Every push to `main` is versioned automatically from those commits
+([go-semantic-release](https://github.com/go-semantic-release/semantic-release)):
+`fix` → patch, `feat` → minor, breaking → major (minor while below `v1.0.0`). The workflow
+tags the commit, publishes a GitHub release with a changelog, and attaches `asyncapi-gen`
+binaries built with [GoReleaser](https://goreleaser.com).
