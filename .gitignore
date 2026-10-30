@@ -1,0 +1,7 @@
+# Written by go-semantic-release during the release job; GoReleaser
+# refuses to run on a dirty tree.
+.semrel/
+.generated-go-semantic-release-changelog.md
+
+# GoReleaser output
+dist/
