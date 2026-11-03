@@ -72,8 +72,8 @@ var (
 )
 
 // Endpoints of the receive operations: the subject and queue each one
-// subscribes with, e.g. to create or bind JetStream consumers (see
-// jsbroker.ConsumerConfig and jsbroker.Broker.Bind).
+// subscribes with, e.g. to fill in the FilterSubject of a JetStream consumer
+// passed to the operation with jsbroker.From.
 var (
 	OnOrderCreatedEndpoint   = broker.Endpoint{Subject: "orders.*.created", Queue: "order-processors"}
 	ServeOrderStatusEndpoint = broker.Endpoint{Subject: "orders.status.get", Queue: "order-status"}

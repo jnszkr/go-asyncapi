@@ -1,16 +1,18 @@
 // Package jsbroker implements broker.Broker on NATS JetStream.
 //
-// The Broker does not create streams or consumers: their configuration
-// (retention, replicas, delivery policy, ack wait, ...) belongs to the
-// application. Create them with the jetstream package and bind each consumer
-// to the endpoint of a receive operation; generated code declares those
-// endpoints, and ConsumerConfig turns one into a starting configuration.
+// The Broker does not create or configure streams and consumers: retention,
+// replicas, delivery policy, ack wait, filters and the rest belong to the
+// application, which creates them with the jetstream package and passes the
+// consumer to each subscription with From:
 //
-//	cons, _ := js.CreateOrUpdateConsumer(ctx, "ORDERS", jsbroker.ConsumerConfig(orders.OnOrderCreatedEndpoint))
-//	b := jsbroker.New(js)
-//	b.Bind(orders.OnOrderCreatedEndpoint, cons)
-//	c := orders.NewClient(b)
-//	c.OnOrderCreated(handle) // consumes from cons
+//	cons, _ := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+//		Durable:       "order-processors",
+//		FilterSubject: orders.OrderCreatedChannel.Pattern(),
+//		AckPolicy:     jetstream.AckExplicitPolicy,
+//		AckWait:       30 * time.Second,
+//	})
+//	c := orders.NewClient(jsbroker.New(js))
+//	c.OnOrderCreated(handle, jsbroker.From(cons, jetstream.PullMaxMessages(10)))
 //
 // Messages are acked when the handler returns nil, nakked (redelivered) when
 // it returns an error, and terminated when the error wraps
@@ -23,7 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"strings"
 
 	"github.com/jnszkr/go-asyncapi/broker"
 	"github.com/nats-io/nats.go"
@@ -34,14 +36,6 @@ import (
 type Broker struct {
 	js      jetstream.JetStream
 	onError func(error)
-
-	mu    sync.Mutex
-	bound map[broker.Endpoint]binding
-}
-
-type binding struct {
-	consumer jetstream.Consumer
-	opts     []jetstream.PullConsumeOpt
 }
 
 var _ broker.Broker = (*Broker)(nil)
@@ -55,7 +49,7 @@ func WithErrorHandler(fn func(error)) Option { return func(b *Broker) { b.onErro
 
 // New returns a Broker using js.
 func New(js jetstream.JetStream, opts ...Option) *Broker {
-	b := &Broker{js: js, onError: func(error) {}, bound: map[broker.Endpoint]binding{}}
+	b := &Broker{js: js, onError: func(error) {}}
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -65,25 +59,18 @@ func New(js jetstream.JetStream, opts ...Option) *Broker {
 // JetStream returns the underlying JetStream context.
 func (b *Broker) JetStream() jetstream.JetStream { return b.js }
 
-// Bind makes Subscribe calls for ep consume from c, with opts passed to
-// c.Consume. Binding an endpoint again replaces the earlier consumer for
-// later subscriptions.
-func (b *Broker) Bind(ep broker.Endpoint, c jetstream.Consumer, opts ...jetstream.PullConsumeOpt) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.bound[ep] = binding{consumer: c, opts: opts}
+type source struct {
+	consumer jetstream.Consumer
+	opts     []jetstream.PullConsumeOpt
 }
 
-// ConsumerConfig is a starting point for a consumer serving ep: it filters
-// on ep.Subject, acks explicitly and, when ep has a queue, is durable with
-// the queue as its name, so that every subscriber sharing the queue shares
-// the consumer. Adjust the result as needed before creating the consumer.
-func ConsumerConfig(ep broker.Endpoint) jetstream.ConsumerConfig {
-	return jetstream.ConsumerConfig{
-		Durable:       ep.Queue,
-		FilterSubject: ep.Subject,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-	}
+// From makes a subscription consume from cons, passing opts to
+// cons.Consume. The consumer is used as configured; its filter subjects
+// must lie within the subscribed subject, since messages that don't match
+// the channel are terminated. The subscription's queue is ignored: every
+// subscription on the same consumer shares its messages.
+func From(cons jetstream.Consumer, opts ...jetstream.PullConsumeOpt) broker.SubOption {
+	return broker.WithSource(source{consumer: cons, opts: opts})
 }
 
 // Publish stores m in the stream that captures m.Subject and waits for the
@@ -102,24 +89,27 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 	return &broker.Message{Subject: rm.Subject, Header: broker.Header(rm.Header), Data: rm.Data}, nil
 }
 
-// ErrNotBound is returned by Subscribe for an endpoint without a consumer.
-var ErrNotBound = errors.New("jsbroker: no consumer bound")
+// ErrNoConsumer is returned by Subscribe when no consumer was given with From.
+var ErrNoConsumer = errors.New("jsbroker: no consumer (use jsbroker.From)")
 
-// Subscribe consumes from the consumer bound to (subject, queue).
-func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message) error) (broker.Subscription, error) {
-	ep := broker.Endpoint{Subject: subject, Queue: queue}
-	b.mu.Lock()
-	bd, ok := b.bound[ep]
-	b.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("%w for subject %q, queue %q", ErrNotBound, subject, queue)
+// Subscribe consumes from the consumer set with From.
+func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) (broker.Subscription, error) {
+	src, ok := cfg.Source.(source)
+	switch {
+	case cfg.Source == nil:
+		return nil, fmt.Errorf("%w for subject %q", ErrNoConsumer, cfg.Subject)
+	case !ok:
+		return nil, fmt.Errorf("jsbroker: unsupported source %T", cfg.Source)
+	}
+	if err := checkFilters(src.consumer, cfg.Subject); err != nil {
+		return nil, err
 	}
 	opts := append([]jetstream.PullConsumeOpt{
 		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
-			b.onError(fmt.Errorf("jsbroker: consume %s: %w", subject, err))
+			b.onError(fmt.Errorf("jsbroker: consume %s: %w", cfg.Subject, err))
 		}),
-	}, bd.opts...)
-	cc, err := bd.consumer.Consume(func(msg jetstream.Msg) {
+	}, src.opts...)
+	cc, err := src.consumer.Consume(func(msg jetstream.Msg) {
 		herr := h(&broker.Message{Subject: msg.Subject(), Header: broker.Header(msg.Headers()), Data: msg.Data()})
 		var aerr error
 		switch {
@@ -150,4 +140,39 @@ func (s subscription) Unsubscribe() error {
 
 func toNATS(m *broker.Message) *nats.Msg {
 	return &nats.Msg{Subject: m.Subject, Reply: m.Reply, Header: nats.Header(m.Header), Data: m.Data}
+}
+
+// checkFilters fails when the consumer filters on subjects outside subject,
+// whose messages the subscription could only terminate. Consumers without a
+// filter get whatever their stream captures and are not checked.
+func checkFilters(c jetstream.Consumer, subject string) error {
+	info := c.CachedInfo()
+	if info == nil {
+		return nil
+	}
+	filters := info.Config.FilterSubjects
+	if f := info.Config.FilterSubject; f != "" {
+		filters = []string{f}
+	}
+	for _, f := range filters {
+		if !within(f, subject) {
+			return fmt.Errorf("jsbroker: consumer %q filters %q, outside subject %q", info.Name, f, subject)
+		}
+	}
+	return nil
+}
+
+// within reports whether every subject matching filter matches pattern.
+// pattern uses only "*" wildcards, as channel patterns do.
+func within(filter, pattern string) bool {
+	f, p := strings.Split(filter, "."), strings.Split(pattern, ".")
+	if len(f) != len(p) {
+		return false
+	}
+	for i := range p {
+		if f[i] == ">" || (p[i] != "*" && p[i] != f[i]) {
+			return false
+		}
+	}
+	return true
 }

@@ -15,19 +15,30 @@ type Broker interface {
 	Publish(ctx context.Context, m *Message) error
 	// Request sends m and waits for a single reply. ctx carries the deadline.
 	Request(ctx context.Context, m *Message) (*Message, error)
-	// Subscribe calls h for every message matching subject. Subjects may
-	// contain "*" wildcards for single tokens. A non-empty queue load
-	// balances messages across subscribers sharing that queue name.
+	// Subscribe calls h for every message matching cfg.Subject. It fails
+	// when cfg.Source is set to something the Broker does not support.
 	//
 	// h returns nil when the message was handled. Brokers with
 	// acknowledgements (see jsbroker) ack on nil, redeliver on an error, and
 	// drop messages whose error wraps ErrMalformed. Others ignore it.
-	Subscribe(subject, queue string, h func(*Message) error) (Subscription, error)
+	Subscribe(cfg SubConfig, h func(*Message) error) (Subscription, error)
+}
+
+// SubConfig describes a subscription. SubOptions fill it in.
+type SubConfig struct {
+	// Subject may contain "*" wildcards for single tokens.
+	Subject string
+	// Queue load balances messages across subscribers sharing the name.
+	Queue string
+	// Source is a transport-specific origin of the messages, such as a
+	// JetStream consumer (see jsbroker.From). Nil means the transport's
+	// default, e.g. a core NATS subscription.
+	Source any
 }
 
 // Endpoint is where a receive operation listens: the subject pattern and
-// queue name it passes to Broker.Subscribe. Generated code declares one per
-// receive operation, e.g. to create or bind JetStream consumers.
+// queue name it subscribes with. Generated code declares one per receive
+// operation, e.g. to fill in a JetStream consumer's FilterSubject.
 type Endpoint struct {
 	Subject string
 	Queue   string

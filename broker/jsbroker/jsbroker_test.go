@@ -9,6 +9,7 @@ import (
 
 	"github.com/jnszkr/go-asyncapi/broker"
 	"github.com/jnszkr/go-asyncapi/broker/jsbroker"
+	"github.com/jnszkr/go-asyncapi/broker/membroker"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -20,9 +21,7 @@ type event struct {
 
 var events = broker.Channel[event]{Address: "events.{kind}"}
 
-var eventsEndpoint = broker.Endpoint{Subject: events.Pattern(), Queue: "workers"}
-
-func setup(t *testing.T) (jetstream.JetStream, jetstream.Consumer) {
+func setup(t *testing.T) jetstream.JetStream {
 	t.Helper()
 	opts := natstest.DefaultTestOptions
 	opts.Port = -1
@@ -43,38 +42,69 @@ func setup(t *testing.T) (jetstream.JetStream, jetstream.Consumer) {
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: "EVENTS", Subjects: []string{"events.>"}}); err != nil {
 		t.Fatal(err)
 	}
-	cfg := jsbroker.ConsumerConfig(eventsEndpoint)
-	cfg.AckWait = time.Second
-	cons, err := js.CreateOrUpdateConsumer(ctx, "EVENTS", cfg)
+	return js
+}
+
+func consumer(t *testing.T, js jetstream.JetStream, cfg jetstream.ConsumerConfig) jetstream.Consumer {
+	t.Helper()
+	cons, err := js.CreateOrUpdateConsumer(context.Background(), "EVENTS", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return js, cons
+	return cons
 }
 
-func TestConsumerConfig(t *testing.T) {
-	cfg := jsbroker.ConsumerConfig(eventsEndpoint)
-	if cfg.Durable != "workers" || cfg.FilterSubject != "events.*" || cfg.AckPolicy != jetstream.AckExplicitPolicy {
-		t.Errorf("config = %+v", cfg)
+func TestSubscribeWithoutConsumerFails(t *testing.T) {
+	c := broker.New(jsbroker.New(setup(t)))
+	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil })
+	if !errors.Is(err, jsbroker.ErrNoConsumer) {
+		t.Fatalf("err = %v, want ErrNoConsumer", err)
 	}
 }
 
-func TestUnboundSubscribeFails(t *testing.T) {
-	js, _ := setup(t)
+// TestFilterOutsideSubjectFails checks that a consumer delivering subjects
+// the channel cannot parse is rejected instead of terminating them.
+func TestFilterOutsideSubjectFails(t *testing.T) {
+	js := setup(t)
 	c := broker.New(jsbroker.New(js))
-	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil })
-	if !errors.Is(err, jsbroker.ErrNotBound) {
-		t.Fatalf("err = %v, want ErrNotBound", err)
+	h := func(context.Context, broker.Received[event]) error { return nil }
+	for _, filter := range []string{"events.>", "other.*", "events.a.b"} {
+		cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckPolicy: jetstream.AckExplicitPolicy})
+		if _, err := broker.Subscribe(c, events, h, jsbroker.From(cons)); err == nil {
+			t.Errorf("filter %q: expected an error", filter)
+		}
+	}
+	for _, filter := range []string{"", "events.*", "events.a"} {
+		cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckPolicy: jetstream.AckExplicitPolicy})
+		sub, err := broker.Subscribe(c, events, h, jsbroker.From(cons))
+		if err != nil {
+			t.Errorf("filter %q: %v", filter, err)
+			continue
+		}
+		sub.Unsubscribe()
+	}
+}
+
+func TestOtherBrokersRejectConsumers(t *testing.T) {
+	cons := consumer(t, setup(t), jetstream.ConsumerConfig{AckPolicy: jetstream.AckExplicitPolicy})
+	c := broker.New(membroker.New())
+	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil }, jsbroker.From(cons))
+	if err == nil {
+		t.Fatal("expected membroker to reject a JetStream consumer")
 	}
 }
 
 // TestAcks checks that a handler error redelivers the message and a
 // malformed message is terminated rather than retried.
 func TestAcks(t *testing.T) {
-	js, cons := setup(t)
-	b := jsbroker.New(js)
-	b.Bind(eventsEndpoint, cons)
-	c := broker.New(b)
+	js := setup(t)
+	cons := consumer(t, js, jetstream.ConsumerConfig{
+		Durable:       "workers",
+		FilterSubject: events.Pattern(),
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Second,
+	})
+	c := broker.New(jsbroker.New(js))
 
 	var attempts atomic.Int32
 	done := make(chan event, 1)
@@ -84,7 +114,7 @@ func TestAcks(t *testing.T) {
 		}
 		done <- m.Payload
 		return nil
-	}, broker.Queue("workers"))
+	}, jsbroker.From(cons))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,8 +158,7 @@ func TestAcks(t *testing.T) {
 }
 
 func TestPublishWithoutStreamFails(t *testing.T) {
-	js, _ := setup(t)
-	c := broker.New(jsbroker.New(js))
+	c := broker.New(jsbroker.New(setup(t)))
 	nowhere := broker.Channel[event]{Address: "nowhere"}
 	if err := broker.Publish(context.Background(), c, nowhere, nil, event{}); err == nil {
 		t.Fatal("expected an error publishing to a subject no stream captures")

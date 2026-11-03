@@ -3,6 +3,7 @@ package natsbroker
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jnszkr/go-asyncapi/broker"
 	"github.com/nats-io/nats.go"
@@ -34,13 +35,16 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 }
 
 // Subscribe uses a core NATS subscription, which has no acknowledgements:
-// the error returned by h is ignored.
-func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message) error) (broker.Subscription, error) {
-	cb := func(m *nats.Msg) { _ = h(fromNATS(m)) }
-	if queue != "" {
-		return b.nc.QueueSubscribe(subject, queue, cb)
+// the error returned by h is ignored. It supports no SubConfig.Source.
+func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) (broker.Subscription, error) {
+	if cfg.Source != nil {
+		return nil, fmt.Errorf("natsbroker: unsupported source %T", cfg.Source)
 	}
-	return b.nc.Subscribe(subject, cb)
+	cb := func(m *nats.Msg) { _ = h(fromNATS(m)) }
+	if cfg.Queue != "" {
+		return b.nc.QueueSubscribe(cfg.Subject, cfg.Queue, cb)
+	}
+	return b.nc.Subscribe(cfg.Subject, cb)
 }
 
 func toNATS(m *broker.Message) *nats.Msg {
