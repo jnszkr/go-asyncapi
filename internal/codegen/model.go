@@ -276,7 +276,7 @@ func (b *builder) channel(ref string) (*channel, error) {
 		Doc:     firstNonEmpty(ch.Description, ch.Summary, ch.Title),
 		Address: *ch.Address,
 	}
-	for _, tok := range strings.Split(c.Address, ".") {
+	for tok := range strings.SplitSeq(c.Address, ".") {
 		if tok == "" {
 			return nil, fmt.Errorf("channel %q: empty token in subject %q", key, c.Address)
 		}

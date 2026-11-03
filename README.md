@@ -10,7 +10,7 @@ including the [NATS bindings](https://github.com/asyncapi/bindings/blob/master/n
 go install github.com/jnszkr/go-asyncapi/cmd/asyncapi-gen@latest
 ```
 
-Requires Go 1.22 or later.
+Requires Go 1.26 or later.
 
 ## Usage
 

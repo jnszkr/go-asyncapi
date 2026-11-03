@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         # The oldest Go version go.mod allows, and the current release.
-        go: ['1.22.x', 'stable']
+        go: ['1.26.x', 'stable']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -23,7 +23,9 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: go vet ./...
       - run: go test -race ./...
-      - name: Generated code is up to date
+      - name: Generated code and vendor are up to date
         run: |
           go generate ./...
+          go mod vendor
+          git add -N .
           git diff --exit-code

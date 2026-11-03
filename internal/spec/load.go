@@ -73,7 +73,7 @@ func (d *Document) lookup(ref string) (any, error) {
 		return nil, fmt.Errorf("unsupported $ref %q: only local refs (#/...) are supported", ref)
 	}
 	node := d.raw
-	for _, tok := range strings.Split(ref[2:], "/") {
+	for tok := range strings.SplitSeq(ref[2:], "/") {
 		tok, err := url.PathUnescape(tok)
 		if err != nil {
 			return nil, fmt.Errorf("$ref %q: %w", ref, err)
