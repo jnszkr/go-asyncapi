@@ -22,7 +22,8 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # go.mod holds the minimum version; binaries use the current release.
+          go-version: stable
       - run: go test ./...
 
       - id: semrel

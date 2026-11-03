@@ -11,11 +11,16 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest Go version go.mod allows, and the current release.
+        go: ['1.22.x', 'stable']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
       - run: go vet ./...
       - run: go test -race ./...
       - name: Generated code is up to date
