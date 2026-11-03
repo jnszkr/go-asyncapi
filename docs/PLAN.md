@@ -63,8 +63,8 @@ examples/             sample specs + checked-in generated output (also golden fi
    - External file `$ref`s
 3. **JetStream** (outside the binding spec)
    - Done: `broker/jsbroker` publishes with stream acks and consumes from pull consumers
-     the application creates and binds to generated `broker.Endpoint`s; handler errors
-     nak, malformed messages are terminated
+     the application creates and configures, passed per subscription with
+     `jsbroker.From`; handler errors nak, malformed messages are terminated
    - Open: push consumers, per-message ack control (in progress, delay), generating
      stream/consumer hints from `x-` extensions
 4. **Polish**

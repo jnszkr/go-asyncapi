@@ -7,6 +7,7 @@ package membroker
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,11 +48,14 @@ func (s *sub) Unsubscribe() error {
 func New() *Broker { return &Broker{next: map[string]int{}} }
 
 // Subscribe registers h. The error h returns is ignored; there is no
-// redelivery.
-func (b *Broker) Subscribe(subject, queue string, h func(*broker.Message) error) (broker.Subscription, error) {
+// redelivery. It supports no SubConfig.Source.
+func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) (broker.Subscription, error) {
+	if cfg.Source != nil {
+		return nil, fmt.Errorf("membroker: unsupported source %T", cfg.Source)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := &sub{b: b, pattern: subject, queue: queue, h: h}
+	s := &sub{b: b, pattern: cfg.Subject, queue: cfg.Queue, h: h}
 	b.subs = append(b.subs, s)
 	return s, nil
 }
@@ -70,7 +74,7 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 	b.mu.Unlock()
 
 	replies := make(chan *broker.Message, 1)
-	s, _ := b.Subscribe(inbox, "", func(r *broker.Message) error {
+	s, _ := b.Subscribe(broker.SubConfig{Subject: inbox}, func(r *broker.Message) error {
 		select {
 		case replies <- r:
 		default:

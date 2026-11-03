@@ -100,12 +100,14 @@ type MsgOption func(*Message)
 func WithHeader(key, value string) MsgOption { return func(m *Message) { m.Header.Set(key, value) } }
 
 // SubOption adjusts a subscription.
-type SubOption func(*subConfig)
-
-type subConfig struct{ queue string }
+type SubOption func(*SubConfig)
 
 // Queue load balances messages across subscribers with the same queue name.
-func Queue(name string) SubOption { return func(s *subConfig) { s.queue = name } }
+func Queue(name string) SubOption { return func(s *SubConfig) { s.Queue = name } }
+
+// WithSource sets SubConfig.Source. Transports wrap it in typed options,
+// such as jsbroker.From.
+func WithSource(src any) SubOption { return func(s *SubConfig) { s.Source = src } }
 
 // Publish sends msg on ch.
 func Publish[T any](ctx context.Context, c *Client, ch Channel[T], p Params, msg T, opts ...MsgOption) error {
@@ -229,11 +231,12 @@ func decode[T any](c *Client, ch Channel[T], m *Message) (Received[T], error) {
 }
 
 func (c *Client) subscribe(subject string, opts []SubOption, h func(*Message) error) (Subscription, error) {
-	var cfg subConfig
+	var cfg SubConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return c.broker.Subscribe(subject, cfg.queue, h)
+	cfg.Subject = subject
+	return c.broker.Subscribe(cfg, h)
 }
 
 // respondError sends err back to the requester. The request counts as

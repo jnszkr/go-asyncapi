@@ -147,8 +147,8 @@ func TestGenericCallsWork(t *testing.T) {
 }
 
 // TestJetStream runs the same generated client on JetStream. The stream and
-// consumer are the application's; the generated endpoint only says which
-// subject and queue the operation subscribes with.
+// consumer are the application's, configured here in full and passed to the
+// receive operation with jsbroker.From.
 func TestJetStream(t *testing.T) {
 	opts := natstest.DefaultTestOptions
 	opts.Port = -1
@@ -171,13 +171,16 @@ func TestJetStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jsbroker.ConsumerConfig(orders.OnOrderCreatedEndpoint))
+	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:       orders.OnOrderCreatedEndpoint.Queue,
+		FilterSubject: orders.OnOrderCreatedEndpoint.Subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       30 * time.Second,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := jsbroker.New(js)
-	b.Bind(orders.OnOrderCreatedEndpoint, cons)
-	c := orders.NewClient(b)
+	c := orders.NewClient(jsbroker.New(js))
 
 	// Published before anyone subscribes: the stream keeps it.
 	if err := c.PublishOrderCreated(ctx, orders.OrderCreatedParams("us"), orders.Order{ID: "o-3"}); err != nil {
@@ -188,7 +191,7 @@ func TestJetStream(t *testing.T) {
 	sub, err := c.OnOrderCreated(func(_ context.Context, m broker.Received[orders.Order]) error {
 		got <- m
 		return nil
-	})
+	}, jsbroker.From(cons, jetstream.PullMaxMessages(10)))
 	if err != nil {
 		t.Fatal(err)
 	}

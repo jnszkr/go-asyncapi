@@ -78,28 +78,34 @@ See [examples/orders](examples/orders) for the full spec and generated code.
 ### JetStream
 
 The same generated client runs on JetStream through `jsbroker`. Streams and consumers
-are not created for you: their configuration (retention, replicas, ack wait, delivery
-policy, ...) is the application's. Each receive operation gets a generated
-`XxxEndpoint` (`broker.Endpoint{Subject, Queue}`) that you bind a consumer to;
-`jsbroker.ConsumerConfig` turns an endpoint into a starting configuration (filter
-subject, explicit acks, durable named after the queue) that you can adjust:
+are not created or configured for you: retention, replicas, ack wait, delivery policy,
+filters and the rest are the application's. Create the consumer with the `jetstream`
+package and pass it to the receive operation with `jsbroker.From`, together with any
+`jetstream.PullConsumeOpt`s for `Consume`. The generated `XxxEndpoint`
+(`broker.Endpoint{Subject, Queue}`) is there if you want the operation's subject and
+queue name in the config:
 
 ```go
 js, _ := jetstream.New(nc)
-cons, _ := js.CreateOrUpdateConsumer(ctx, "ORDERS", jsbroker.ConsumerConfig(orders.OnOrderCreatedEndpoint))
+cons, _ := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+	Durable:       "order-processors",
+	FilterSubject: orders.OnOrderCreatedEndpoint.Subject, // orders.*.created
+	AckPolicy:     jetstream.AckExplicitPolicy,
+	AckWait:       30 * time.Second,
+})
 
-b := jsbroker.New(js)
-b.Bind(orders.OnOrderCreatedEndpoint, cons) // or bind a consumer you looked up with js.Consumer
-c := orders.NewClient(b)
-
-c.OnOrderCreated(handle) // consumes from cons
+c := orders.NewClient(jsbroker.New(js))
+c.OnOrderCreated(handle, jsbroker.From(cons, jetstream.PullMaxMessages(10)))
 c.PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), order) // waits for the stream's ack
 ```
 
 A handler returning `nil` acks the message, an error naks it (redelivery), and a
-message that cannot be decoded is terminated. Subscribing to an unbound endpoint fails
-with `jsbroker.ErrNotBound`. Request/reply is not stored: `Request` goes over core NATS,
-and responders should use a `natsbroker` client.
+message that cannot be decoded is terminated. Subscribing without `jsbroker.From` fails
+with `jsbroker.ErrNoConsumer`, and a consumer whose filter reaches outside the
+operation's subject is rejected rather than having those messages terminated. Other
+brokers reject `jsbroker.From`.
+Request/reply is not stored: `Request` goes over core NATS, and responders should use a
+`natsbroker` client.
 
 ## Mapping
 
