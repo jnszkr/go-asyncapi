@@ -13,14 +13,15 @@ import (
 // model is the template input: the AsyncAPI document reduced to models,
 // channel definitions and the operations of the thin generated client.
 type model struct {
-	Package  string
-	Title    string
-	Version  string
-	Imports  []string
-	Types    []*typeDecl
-	Headers  []*headerDecl
-	Channels []*channel
-	Ops      []*operation
+	Package    string
+	Title      string
+	Version    string
+	ModelsOnly bool
+	Imports    []string
+	Types      []*typeDecl
+	Headers    []*headerDecl
+	Channels   []*channel
+	Ops        []*operation
 }
 
 type channel struct {

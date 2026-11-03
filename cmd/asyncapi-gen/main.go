@@ -23,6 +23,7 @@ func run() error {
 	out := flag.String("out", "", "output directory for the generated package")
 	pkg := flag.String("package", "", "name of the generated package (default: base name of -out)")
 	file := flag.String("file", "asyncapi.gen.go", "name of the generated file")
+	modelsOnly := flag.Bool("models-only", false, "generate only types and header-name constants, without channels or a client")
 	flag.Parse()
 
 	if *specPath == "" || *out == "" {
@@ -41,7 +42,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	src, err := codegen.Generate(doc, codegen.Options{Package: *pkg})
+	src, err := codegen.Generate(doc, codegen.Options{Package: *pkg, ModelsOnly: *modelsOnly})
 	if err != nil {
 		return err
 	}

@@ -13,7 +13,7 @@ go install github.com/jnszkr/go-asyncapi/cmd/asyncapi-gen@latest
 ## Usage
 
 ```sh
-asyncapi-gen -spec asyncapi.yaml -out ./gen/orders [-package orders]
+asyncapi-gen -spec asyncapi.yaml -out ./gen/orders [-package orders] [-models-only]
 ```
 
 or from a `go:generate` directive:
@@ -21,6 +21,10 @@ or from a `go:generate` directive:
 ```go
 //go:generate go run github.com/jnszkr/go-asyncapi/cmd/asyncapi-gen -spec asyncapi.yaml -out gen/orders
 ```
+
+Pass `-models-only` to generate just the types and header-name constants, without
+channels or a client. That package does not depend on `broker`, so it suits code that
+only needs the message formats.
 
 ## How it fits together
 

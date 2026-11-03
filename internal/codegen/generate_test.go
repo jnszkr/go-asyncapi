@@ -3,6 +3,11 @@ package codegen
 import (
 	"bytes"
 	"flag"
+	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +89,109 @@ operations:
 		if !strings.Contains(out, want) {
 			t.Errorf("generated code does not contain %q:\n%s", want, out)
 		}
+	}
+}
+
+// typecheck fails the test if src does not compile on its own, e.g. because
+// of an unused import.
+func typecheck(t *testing.T, src string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "gen.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := types.Config{Importer: importer.ForCompiler(fset, "source", nil)}
+	if _, err := conf.Check("p", fset, []*ast.File{f}, nil); err != nil {
+		t.Fatalf("generated code does not compile: %v\n%s", err, src)
+	}
+}
+
+func TestModelsOnly(t *testing.T) {
+	tests := map[string]struct {
+		src  string
+		want []string
+	}{
+		"operations are dropped": {
+			src: `
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  orders:
+    address: orders.{region}
+    parameters: {region: {enum: [eu]}}
+    messages:
+      order:
+        headers:
+          type: object
+          properties: {trace: {type: string}}
+        payload:
+          type: object
+          properties:
+            at: {type: string, format: date-time}
+operations:
+  sendOrder:
+    action: send
+    channel: {$ref: '#/channels/orders'}
+  onOrder:
+    action: receive
+    channel: {$ref: '#/channels/orders'}
+`,
+			want: []string{"type Order struct", `OrderHeaderTrace = "trace"`, `"time"`},
+		},
+		"nothing to import": {
+			src: `
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+components:
+  schemas:
+    Name: {type: string}
+`,
+			want: []string{"type Name = string"},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			doc, err := spec.Parse([]byte(tc.src))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := Generate(doc, Options{Package: "p", ModelsOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := string(got)
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("generated code does not contain %q:\n%s", want, out)
+				}
+			}
+			for _, unwanted := range []string{"broker", "Client", "Channel", "Endpoint", "Params", "context"} {
+				if strings.Contains(out, unwanted) {
+					t.Errorf("generated code contains %q:\n%s", unwanted, out)
+				}
+			}
+			typecheck(t, out)
+		})
+	}
+}
+
+func TestModelsOnlyStillValidatesOperations(t *testing.T) {
+	doc, err := spec.Parse([]byte(`
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  c:
+    address: a.>
+    messages: {m: {payload: {type: string}}}
+operations:
+  o: {action: send, channel: {$ref: '#/channels/c'}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Generate(doc, Options{Package: "p", ModelsOnly: true}); err == nil || !strings.Contains(err.Error(), "wildcards") {
+		t.Fatalf("got error %v, want it to contain %q", err, "wildcards")
 	}
 }
 
