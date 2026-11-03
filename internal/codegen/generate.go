@@ -21,6 +21,9 @@ var tmplSrc string
 type Options struct {
 	// Package is the name of the generated Go package.
 	Package string
+	// ModelsOnly limits the output to types and header-name constants, leaving
+	// out channels and the client so the package does not depend on broker.
+	ModelsOnly bool
 }
 
 // Generate renders the Go source for doc.
@@ -31,6 +34,10 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 	m, err := buildModel(doc, opts.Package)
 	if err != nil {
 		return nil, err
+	}
+	if opts.ModelsOnly {
+		m.ModelsOnly = true
+		m.Channels, m.Ops = nil, nil
 	}
 	m.Imports = imports(m)
 
