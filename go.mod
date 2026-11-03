@@ -1,6 +1,6 @@
 module github.com/jnszkr/go-asyncapi
 
-go 1.27.3
+go 1.26.0
 
 require (
 	github.com/nats-io/nats-server/v2 v2.15.2
