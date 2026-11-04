@@ -24,7 +24,7 @@ asyncapi-gen -spec asyncapi.yaml -out ./gen/events -package events
 All messaging logic lives in the importable `broker` package and is written once with
 generics: `Channel[T]`, `Publish[T]`, `Subscribe[T]`, `Request[Req, Resp]`,
 `Respond[Req, Resp]`. Transports implement the small `broker.Broker` interface
-(`natsbroker` for NATS, `membroker` in memory for tests).
+(`natsbroker` for NATS, `jsbroker` for JetStream, `membroker` in memory for tests).
 
 The generator only emits what is specific to a document:
 
@@ -49,28 +49,39 @@ examples/             sample specs + checked-in generated output (also golden fi
 
 ## Phases
 
-1. **MVP (this branch)**
+1. **Core** (done)
    - AsyncAPI 3.0.x and 3.1.x, YAML and JSON input, local `#/...` `$ref`s
-   - JSON Schema subset: object, array, string (+`date-time` → `time.Time`), integer, number, boolean, enum, `additionalProperties`, `$ref`, nested inline objects
+   - JSON Schema subset: object, array, string (+`date-time` → `time.Time`), integer, number, boolean, enum, `additionalProperties`, `allOf`, `$ref`, nested inline objects
    - Channel parameters with wildcard subscription + subject parsing
    - Publish / subscribe / queue-subscribe / request-reply
    - Golden-file tests and an integration test against an embedded `nats-server`
-2. **Breadth**
+2. **Using it in applications** (done)
+   - Choosing the generated parts with `-generate`, and existing Go types with `x-go-type`
+   - Failing on documents the generated code could not match
+   - Optional payload validation with `broker/schemavalidate`
+   - Application-supplied transports and error codecs, and interceptors
+3. **JetStream** (outside the binding spec)
+   - Done: `broker/jsbroker` publishes with stream acks and consumes from pull consumers
+     the application creates and configures, passed per subscription with `jsbroker.From`
+     or created on subscribing with `jsbroker.FromFactory`; handler errors nak, malformed
+     messages are terminated, and interceptors can settle each message themselves
+   - Open: push consumers, generating stream/consumer hints from `x-` extensions
+4. **Breadth**
    - Multiple message types per channel / operation (discriminated decoding)
    - Typed header structs on top of `broker.Header`
    - Typed `oneOf` / `anyOf` schemas
    - Nullable `type: [string, "null"]`
-   - Reply addresses
+   - Reply addresses (an error today: replies go to the reply subject NATS provides)
    - AsyncAPI 2.6 input (publish/subscribe semantics inverted vs 3.0)
    - External file `$ref`s
-3. **JetStream** (outside the binding spec)
-   - Done: `broker/jsbroker` publishes with stream acks and consumes from pull consumers
-     the application creates and configures, passed per subscription with
-     `jsbroker.From`; handler errors nak, malformed messages are terminated
-   - Open: push consumers, per-message ack control (in progress, delay), generating
-     stream/consumer hints from `x-` extensions
-4. **Polish**
+5. **Polish**
    - Docs site, more examples (versioned releases with binaries are automated from `main`)
+
+## Before v1.0.0
+
+- Multiple message types per channel: documents using them fail to generate today
+- Generating from a range of real-world AsyncAPI documents, not only `examples/orders`
+- Use in a real service, and a stretch without breaking changes
 
 ## Non-goals / constraints
 
