@@ -472,3 +472,60 @@ components:
 		})
 	}
 }
+
+func TestConstructorsTakeOnlyWhatTheyUse(t *testing.T) {
+	out, err := generate(t, `
+asyncapi: 3.0.0
+info: {title: T, version: 1.0.0}
+channels:
+  a:
+    address: a
+    messages:
+      m:
+        payload: {type: string}
+  b:
+    address: b
+    messages:
+      m:
+        payload: {type: string}
+  r:
+    address: null
+    messages:
+      m:
+        payload: {type: string}
+operations:
+  sendA:
+    action: send
+    channel: {$ref: '#/channels/a'}
+  onA:
+    action: receive
+    channel: {$ref: '#/channels/a'}
+  getB:
+    action: send
+    channel: {$ref: '#/channels/b'}
+    reply:
+      channel: {$ref: '#/channels/r'}
+  serveB:
+    action: receive
+    channel: {$ref: '#/channels/b'}
+    reply:
+      channel: {$ref: '#/channels/r'}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`func NewProducer(b broker.Publisher, opts ...broker.Option) *Producer {`,
+		`return &Producer{Client: broker.ForPublisher(b, opts...)}`,
+		`func NewConsumer(b broker.Subscriber, opts ...broker.Option) *Consumer {`,
+		`return &Consumer{Client: broker.ForSubscriber(b, opts...)}`,
+		`func NewClient(b broker.Requester, opts ...broker.Option) *Client {`,
+		`return &Client{Client: broker.ForRequester(b, opts...)}`,
+		`func NewServer(b broker.PubSub, opts ...broker.Option) *Server {`,
+		`return &Server{Client: broker.ForPubSub(b, opts...)}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("generated code does not contain %q:\n%s", want, out)
+		}
+	}
+}

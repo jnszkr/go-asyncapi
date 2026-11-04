@@ -268,3 +268,74 @@ func TestValidation(t *testing.T) {
 		t.Errorf("invalid reply: err = %v, want a RemoteError with code 500", err)
 	}
 }
+
+// requesterFunc is all a request client needs from its transport.
+type requesterFunc func(context.Context, *broker.Message) (*broker.Message, error)
+
+func (f requesterFunc) Request(ctx context.Context, m *broker.Message) (*broker.Message, error) {
+	return f(ctx, m)
+}
+
+type requestIDKey struct{}
+
+// serverSide wraps a broker to extract an incoming header into the handler's
+// context, and to copy it back onto the reply.
+type serverSide struct{ broker.PubSub }
+
+func (b serverSide) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
+	return b.PubSub.Subscribe(cfg, func(ctx context.Context, m *broker.Message) error {
+		return h(context.WithValue(ctx, requestIDKey{}, m.Header.Get("X-Request-Id")), m)
+	})
+}
+
+func (b serverSide) Publish(ctx context.Context, m *broker.Message) error {
+	if id, ok := ctx.Value(requestIDKey{}).(string); ok {
+		m.Header.Set("X-Request-Id", id)
+	}
+	return b.PubSub.Publish(ctx, m)
+}
+
+// TestApplicationSuppliedTransports runs the generated Client and Server over
+// transports written by the application, on a real NATS connection.
+func TestApplicationSuppliedTransports(t *testing.T) {
+	nb := natsbroker.New(connect(t))
+
+	s := orders.NewServer(serverSide{nb})
+	var handlerID any
+	sub, err := s.ServeOrderStatus(func(ctx context.Context, m broker.Received[orders.StatusRequest]) (orders.StatusReply, error) {
+		handlerID = ctx.Value(requestIDKey{})
+		return orders.StatusReply{OrderID: m.Payload.OrderID}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	if err := nb.Conn().Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	var replyID string
+	c := orders.NewClient(requesterFunc(func(ctx context.Context, m *broker.Message) (*broker.Message, error) {
+		m.Header.Set("X-Request-Id", "r-1")
+		rm, err := nb.Request(ctx, m)
+		if err == nil {
+			replyID = rm.Header.Get("X-Request-Id")
+		}
+		return rm, err
+	}))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := c.GetOrderStatus(ctx, orders.StatusRequest{OrderID: "o-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OrderID != "o-1" {
+		t.Errorf("reply = %+v", resp)
+	}
+	if handlerID != "r-1" {
+		t.Errorf("request ID in handler context = %v, want r-1", handlerID)
+	}
+	if replyID != "r-1" {
+		t.Errorf("request ID on reply = %q, want r-1", replyID)
+	}
+}

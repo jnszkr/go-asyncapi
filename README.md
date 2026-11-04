@@ -49,7 +49,8 @@ named like a generated type, such as `Consumer`, is an error when that part is g
 broker/              generic, transport-agnostic runtime
   Channel[T]         address + allowed parameter values for payload type T
   Publish[T]         Subscribe[T]   Request[Req, Resp]   Respond[Req, Resp]
-  Broker             interface: Publish / Request / Subscribe
+  Broker             interface: Publish / Request / Subscribe, made up of
+                     Publisher, Requester and Subscriber
   Endpoint           subject + queue a receive operation subscribes with
 broker/natsbroker    Broker on a *nats.Conn (core NATS)
 broker/jsbroker      Broker on JetStream, consuming from consumers you create
@@ -195,7 +196,76 @@ validator next to a `Producer` without one checks incoming messages alone. A `Cl
 | `x-go-type` on a schema | your existing Go type instead of a generated one |
 
 Responder errors are sent back using the `Nats-Service-Error` / `Nats-Service-Error-Code`
-headers and surface as `*broker.RemoteError` on the requesting side.
+headers and surface as `*broker.RemoteError` on the requesting side. Use
+`broker.WithErrorCodec` to change that (see below).
+
+### Bringing your own transport
+
+Like the HTTP client you hand to a generated OpenAPI client, the transport of a generated
+type comes from outside, and is where tracing, authentication and the like belong. Each
+constructor asks only for what its type uses:
+
+| Generated type | Constructor takes | Methods |
+|---|---|---|
+| `Producer` | `broker.Publisher` | `Publish` |
+| `Client` | `broker.Requester` | `Request` |
+| `Consumer` | `broker.Subscriber` | `Subscribe` |
+| `Server` | `broker.PubSub` | `Subscribe`, and `Publish` for the replies |
+
+A request client therefore needs one method, over whatever you already send requests with:
+
+```go
+type requester struct{ send *mynats.RequestSender }
+
+func (r requester) Request(ctx context.Context, m *broker.Message) (*broker.Message, error) {
+	return r.send.Do(ctx, m.Subject, m.Header, m.Data)
+}
+
+client := orders.NewClient(requester{send})
+```
+
+The embedded `*broker.Client` still accepts every generic function, and picks up whichever
+other methods your transport has. Calling one it lacks returns `broker.ErrUnsupported`.
+
+On the receiving side, the context a `Subscriber` passes to its handler becomes the context
+of your generated handler. Wrap a broker to open a span or apply a caller's deadline around
+each message:
+
+```go
+type traced struct{ broker.PubSub }
+
+func (b traced) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
+	return b.PubSub.Subscribe(cfg, func(ctx context.Context, m *broker.Message) error {
+		ctx, span := tracer.Start(extract(ctx, m.Header), cfg.Subject)
+		defer span.End()
+		return h(ctx, m)
+	})
+}
+
+server := orders.NewServer(traced{natsbroker.New(nc)})
+```
+
+Replies are published with that context's values, so `Publish` can tag them with the same
+span, but without its deadline, so a handler that ran out of time can still say so.
+
+To keep your own convention for errors in replies, implement `broker.ErrorCodec` and pass it
+with `broker.WithErrorCodec` on both sides. `DecodeError` can return your existing error
+type, and `Request` hands it to the caller unchanged:
+
+```go
+type errorCodec struct{}
+
+func (errorCodec) EncodeError(reply *broker.Message, _ string, err error) {
+	reply.Header.Set("X-Error-Message", err.Error())
+}
+
+func (errorCodec) DecodeError(reply *broker.Message) error {
+	if msg := reply.Header.Get("X-Error-Message"); msg != "" {
+		return &myproject.RequestError{Message: msg}
+	}
+	return nil
+}
+```
 
 ### Using your own types
 
