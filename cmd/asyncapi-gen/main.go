@@ -47,7 +47,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	src, err := codegen.Generate(doc, codegen.Options{Package: *pkg, Parts: parts})
+	src, err := codegen.Generate(doc, codegen.Options{
+		Package: *pkg,
+		Parts:   parts,
+		Warn:    func(w string) { fmt.Fprintln(os.Stderr, "asyncapi-gen: warning:", w) },
+	})
 	if err != nil {
 		return err
 	}

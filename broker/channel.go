@@ -16,6 +16,8 @@ type Channel[T any] struct {
 	Address string
 	// Allowed restricts parameter values; parameters not listed accept any value.
 	Allowed map[string][]string
+	// Defaults are used for parameters without a value.
+	Defaults map[string]string
 }
 
 // Subject returns the concrete subject for p.
@@ -26,7 +28,11 @@ func (c Channel[T]) Subject(p Params) (string, error) {
 		if !ok {
 			continue
 		}
-		v, err := c.value(name, p[name])
+		v := p[name]
+		if v == "" {
+			v = c.Defaults[name]
+		}
+		v, err := c.value(name, v)
 		if err != nil {
 			return "", err
 		}

@@ -42,6 +42,13 @@ var (
 {{- end}}{{end}}
 		},
 {{- end}}
+{{- if .HasDefaults}}
+		Defaults: map[string]string{
+{{- range .Params}}{{if .Default}}
+			{{printf "%q" .Key}}: {{printf "%q" .Default}},
+{{- end}}{{end}}
+		},
+{{- end}}
 	}
 {{- end}}
 )
@@ -128,7 +135,7 @@ type {{.Name}} {{.Under}}
 const (
 {{- $t := .Name}}
 {{- range .Values}}
-	{{$t}}{{export .}} {{$t}} = {{printf "%q" .}}
+	{{$t}}{{.Name}} {{$t}} = {{.Literal}}
 {{- end}}
 )
 {{- else}}

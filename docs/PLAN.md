@@ -50,7 +50,7 @@ examples/             sample specs + checked-in generated output (also golden fi
 ## Phases
 
 1. **MVP (this branch)**
-   - AsyncAPI 3.0.x, YAML and JSON input, local `#/...` `$ref`s
+   - AsyncAPI 3.0.x and 3.1.x, YAML and JSON input, local `#/...` `$ref`s
    - JSON Schema subset: object, array, string (+`date-time` → `time.Time`), integer, number, boolean, enum, `additionalProperties`, `$ref`, nested inline objects
    - Channel parameters with wildcard subscription + subject parsing
    - Publish / subscribe / queue-subscribe / request-reply
@@ -58,7 +58,9 @@ examples/             sample specs + checked-in generated output (also golden fi
 2. **Breadth**
    - Multiple message types per channel / operation (discriminated decoding)
    - Typed header structs on top of `broker.Header`
-   - `oneOf` / `anyOf` / `allOf` schemas
+   - Typed `oneOf` / `anyOf` schemas
+   - Nullable `type: [string, "null"]`
+   - Reply addresses
    - AsyncAPI 2.6 input (publish/subscribe semantics inverted vs 3.0)
    - External file `$ref`s
 3. **JetStream** (outside the binding spec)

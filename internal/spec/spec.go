@@ -1,8 +1,10 @@
-// Package spec models the subset of the AsyncAPI 3.0 document that the
-// generator understands, including the NATS bindings.
+// Package spec models the subset of the AsyncAPI 3.0 and 3.1 documents that
+// the generator understands, including the NATS bindings.
 package spec
 
-// Document is an AsyncAPI 3.0 document.
+import "gopkg.in/yaml.v3"
+
+// Document is an AsyncAPI 3.0 or 3.1 document.
 type Document struct {
 	AsyncAPI           string                `yaml:"asyncapi"`
 	ID                 string                `yaml:"id"`
@@ -69,6 +71,18 @@ type Operation struct {
 	Messages    []*Reference       `yaml:"messages"`
 	Reply       *OperationReply    `yaml:"reply"`
 	Bindings    *OperationBindings `yaml:"bindings"`
+	Traits      []any              `yaml:"traits"`
+
+	// raw is the undecoded operation, used to merge traits.
+	raw map[string]any
+}
+
+func (o *Operation) UnmarshalYAML(n *yaml.Node) error {
+	type plain Operation
+	if err := n.Decode((*plain)(o)); err != nil {
+		return err
+	}
+	return n.Decode(&o.raw)
 }
 
 type OperationReply struct {
@@ -99,6 +113,18 @@ type Message struct {
 	Payload       *Schema          `yaml:"payload"`
 	CorrelationID any              `yaml:"correlationId"`
 	Bindings      *MessageBindings `yaml:"bindings"`
+	Traits        []any            `yaml:"traits"`
+
+	// raw is the undecoded message, used to merge traits.
+	raw map[string]any
+}
+
+func (m *Message) UnmarshalYAML(n *yaml.Node) error {
+	type plain Message
+	if err := n.Decode((*plain)(m)); err != nil {
+		return err
+	}
+	return n.Decode(&m.raw)
 }
 
 // Schema is a JSON Schema (draft-07 subset) as used by AsyncAPI.
@@ -116,6 +142,13 @@ type Schema struct {
 	OneOf                []*Schema          `yaml:"oneOf"`
 	AnyOf                []*Schema          `yaml:"anyOf"`
 	AllOf                []*Schema          `yaml:"allOf"`
+	Const                any                `yaml:"const"`
+	Not                  any                `yaml:"not"`
+	If                   any                `yaml:"if"`
+	// SchemaFormat and Inner make this a Multi Format Schema. Inner stays
+	// undecoded because other formats, such as Protobuf, are not JSON Schema.
+	SchemaFormat string    `yaml:"schemaFormat"`
+	Inner        yaml.Node `yaml:"schema"`
 	// GoType is the x-go-type extension: an existing Go type to use instead
 	// of generating one. GoTypeImport is the import path of its package.
 	GoType       string `yaml:"x-go-type"`

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -41,9 +43,17 @@ func Parse(b []byte) (*Document, error) {
 // Validate checks the parts of the document the generator relies on.
 func (d *Document) Validate() error {
 	var errs []error
-	if !strings.HasPrefix(d.AsyncAPI, "3.") {
-		errs = append(errs, fmt.Errorf("unsupported asyncapi version %q: only 3.x is supported", d.AsyncAPI))
+	if !versionRe.MatchString(d.AsyncAPI) {
+		errs = append(errs, fmt.Errorf("unsupported asyncapi version %q: only 3.0 and 3.1 are supported", d.AsyncAPI))
 	}
+	if d.Info.Title == "" {
+		errs = append(errs, errors.New("info.title is required"))
+	}
+	if d.Info.Version == "" {
+		errs = append(errs, errors.New("info.version is required"))
+	}
+	errs = append(errs, checkFields(d.raw, documentShape, "")...)
+	errs = append(errs, d.validateParameters()...)
 	for name, op := range d.Operations {
 		op, _, err := d.ResolveOperation(op)
 		if err != nil {
@@ -56,6 +66,9 @@ func (d *Document) Validate() error {
 		if op.Channel == nil || op.Channel.Ref == "" {
 			errs = append(errs, fmt.Errorf("operation %q: channel is required", name))
 		}
+		if err := d.validateMessages(op); err != nil {
+			errs = append(errs, fmt.Errorf("operation %q: %w", name, err))
+		}
 		if op.Bindings != nil && op.Bindings.NATS != nil {
 			if q := op.Bindings.NATS.Queue; len(q) > maxQueueLen {
 				errs = append(errs, fmt.Errorf("operation %q: nats queue exceeds %d characters", name, maxQueueLen))
@@ -65,6 +78,115 @@ func (d *Document) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+var (
+	versionRe = regexp.MustCompile(`^3\.[01]\.\d+`)
+	paramRe   = regexp.MustCompile(`\{([^{}]+)\}`)
+)
+
+// validateParameters checks that channel parameters match their addresses,
+// which the specification requires in both directions.
+func (d *Document) validateParameters() []error {
+	var errs []error
+	check := func(prefix string, channels map[string]*Channel) {
+		for name, raw := range channels {
+			ch, _, err := d.ResolveChannel(raw)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s %q: %w", prefix, name, err))
+				continue
+			}
+			if ch.Address == nil {
+				continue
+			}
+			used := map[string]bool{}
+			for _, m := range paramRe.FindAllStringSubmatch(*ch.Address, -1) {
+				used[m[1]] = true
+				if _, ok := ch.Parameters[m[1]]; !ok {
+					errs = append(errs, fmt.Errorf("%s %q: address uses parameter %q, which parameters does not declare", prefix, name, m[1]))
+				}
+			}
+			for p := range ch.Parameters {
+				if !used[p] {
+					errs = append(errs, fmt.Errorf("%s %q: parameter %q is not used in the address", prefix, name, p))
+				}
+			}
+		}
+	}
+	check("channel", d.Channels)
+	check("component channel", d.Components.Channels)
+	return errs
+}
+
+// validateMessages checks that the messages of an operation and its reply
+// belong to their channels.
+func (d *Document) validateMessages(op *Operation) error {
+	var errs []error
+	if op.Channel != nil {
+		errs = append(errs, d.checkChannelMessages(op.Channel.Ref, op.Messages))
+	}
+	if op.Reply != nil {
+		reply, _, err := d.ResolveReply(op.Reply)
+		if err != nil {
+			errs = append(errs, err)
+		} else if reply.Channel != nil {
+			errs = append(errs, d.checkChannelMessages(reply.Channel.Ref, reply.Messages))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (d *Document) checkChannelMessages(channelRef string, refs []*Reference) error {
+	if channelRef == "" || len(refs) == 0 {
+		return nil
+	}
+	ch, _, err := d.ChannelByRef(channelRef)
+	if err != nil {
+		return err
+	}
+	base, err := d.CanonicalRef(channelRef)
+	if err != nil {
+		return err
+	}
+	var own []string
+	for key := range ch.Messages {
+		c, err := d.CanonicalRef(base + "/messages/" + key)
+		if err != nil {
+			return err
+		}
+		own = append(own, c)
+	}
+	for _, ref := range refs {
+		c, err := d.CanonicalRef(ref.Ref)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(own, c) {
+			return fmt.Errorf("%q is not a message of its channel %q", ref.Ref, channelRef)
+		}
+	}
+	return nil
+}
+
+// CanonicalRef follows a chain of $refs and returns the last one, which
+// identifies the referenced object however it was reached.
+func (d *Document) CanonicalRef(ref string) (string, error) {
+	for range maxRefDepth {
+		node, err := d.lookup(ref)
+		if err != nil {
+			return "", err
+		}
+		m, ok := node.(map[string]any)
+		if !ok {
+			return ref, nil
+		}
+		next, ok := m["$ref"].(string)
+		if !ok {
+			return ref, nil
+		}
+		ref = next
+	}
+	return "", fmt.Errorf("$ref %q: chain too deep (cycle?)", ref)
 }
 
 // lookup returns the raw node addressed by a local JSON pointer ref ("#/a/b").
@@ -138,20 +260,156 @@ func (d *Document) ResolveChannel(c *Channel) (*Channel, string, error) {
 	return resolve(d, c, func(c *Channel) string { return c.Ref })
 }
 
+// ResolveOperation resolves $refs and applies the operation's traits.
 func (d *Document) ResolveOperation(o *Operation) (*Operation, string, error) {
-	return resolve(d, o, func(o *Operation) string { return o.Ref })
+	o, name, err := resolve(d, o, func(o *Operation) string { return o.Ref })
+	if err != nil || o == nil || len(o.Traits) == 0 {
+		return o, name, err
+	}
+	merged, err := mergeTraits[Operation](d, o.raw, o.Traits)
+	return merged, name, err
 }
 
+// ResolveMessage resolves $refs and applies the message's traits.
 func (d *Document) ResolveMessage(m *Message) (*Message, string, error) {
-	return resolve(d, m, func(m *Message) string { return m.Ref })
+	m, name, err := resolve(d, m, func(m *Message) string { return m.Ref })
+	if err != nil || m == nil || len(m.Traits) == 0 {
+		return m, name, err
+	}
+	merged, err := mergeTraits[Message](d, m.raw, m.Traits)
+	return merged, name, err
 }
 
+// mergeTraits applies the Traits Merge Mechanism: traits are merged in order
+// with JSON Merge Patch, and never override a property of the target itself.
+func mergeTraits[T any](d *Document, target map[string]any, traits []any) (*T, error) {
+	var merged any = map[string]any{}
+	for _, trait := range traits {
+		for i := 0; ; i++ {
+			m, ok := trait.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("trait must be an object, got %v", trait)
+			}
+			ref, ok := m["$ref"].(string)
+			if !ok {
+				break
+			}
+			if i == maxRefDepth {
+				return nil, fmt.Errorf("trait $ref %q: chain too deep (cycle?)", ref)
+			}
+			var err error
+			if trait, err = d.lookup(ref); err != nil {
+				return nil, err
+			}
+		}
+		merged = mergePatch(merged, trait)
+	}
+	own := make(map[string]any, len(target))
+	for k, v := range target {
+		if k != "traits" {
+			own[k] = v
+		}
+	}
+	merged = mergePatch(merged, own)
+	b, err := yaml.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	out := new(T)
+	if err := yaml.Unmarshal(b, out); err != nil {
+		return nil, fmt.Errorf("apply traits: %w", err)
+	}
+	return out, nil
+}
+
+// mergePatch implements JSON Merge Patch (RFC 7386).
+func mergePatch(target, patch any) any {
+	p, ok := patch.(map[string]any)
+	if !ok {
+		return patch
+	}
+	t, ok := target.(map[string]any)
+	if !ok {
+		t = nil
+	}
+	out := make(map[string]any, len(t)+len(p))
+	for k, v := range t {
+		out[k] = v
+	}
+	for k, v := range p {
+		if v == nil {
+			delete(out, k)
+		} else {
+			out[k] = mergePatch(out[k], v)
+		}
+	}
+	return out
+}
+
+// ResolveSchema follows $refs and Multi Format Schema wrappers until it
+// reaches a plain schema.
 func (d *Document) ResolveSchema(s *Schema) (*Schema, string, error) {
-	return resolve(d, s, func(s *Schema) string { return s.Ref })
+	name := ""
+	for range maxRefDepth {
+		next, n, err := resolve(d, s, func(s *Schema) string { return s.Ref })
+		if err != nil {
+			return nil, "", err
+		}
+		if n != "" {
+			name = n
+		}
+		if !next.IsMultiFormat() {
+			return next, name, nil
+		}
+		if s, err = next.Unwrap(); err != nil {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("schema nested too deep (cycle?)")
+}
+
+// IsMultiFormat reports whether s is a Multi Format Schema wrapper.
+func (s *Schema) IsMultiFormat() bool {
+	return s != nil && (s.SchemaFormat != "" || !s.Inner.IsZero())
+}
+
+// Unwrap returns the schema inside a Multi Format Schema wrapper, or s itself
+// if it is not one. Formats other than JSON Schema are an error.
+func (s *Schema) Unwrap() (*Schema, error) {
+	if !s.IsMultiFormat() {
+		return s, nil
+	}
+	if !supportedSchemaFormat(s.SchemaFormat) {
+		return nil, fmt.Errorf("unsupported schemaFormat %q: only AsyncAPI and JSON Schema draft-07 schemas are supported", s.SchemaFormat)
+	}
+	inner := new(Schema)
+	if err := s.Inner.Decode(inner); err != nil {
+		return nil, fmt.Errorf("schemaFormat %q: %w", s.SchemaFormat, err)
+	}
+	return inner, nil
+}
+
+// supportedSchemaFormat reports whether format is one every implementation
+// must support. An empty format means the default, the AsyncAPI schema.
+func supportedSchemaFormat(format string) bool {
+	media, params, _ := strings.Cut(strings.ReplaceAll(format, " ", ""), ";")
+	switch media {
+	case "":
+		return format == ""
+	case "application/vnd.aai.asyncapi", "application/vnd.aai.asyncapi+json", "application/vnd.aai.asyncapi+yaml":
+		return true
+	case "application/schema+json", "application/schema+yaml":
+		return params == "version=draft-07"
+	}
+	return false
 }
 
 func (d *Document) ResolveParameter(p *Parameter) (*Parameter, string, error) {
 	return resolve(d, p, func(p *Parameter) string { return p.Ref })
+}
+
+func (d *Document) ResolveServer(s *Server) (*Server, string, error) {
+	return resolve(d, s, func(s *Server) string { return s.Ref })
 }
 
 func (d *Document) ResolveReply(r *OperationReply) (*OperationReply, string, error) {

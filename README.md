@@ -4,7 +4,7 @@
 [![lint](https://img.shields.io/github/actions/workflow/status/jnszkr/go-asyncapi/lint.yml?branch=main&label=lint)](https://github.com/jnszkr/go-asyncapi/actions/workflows/lint.yml)
 
 Generate typed Go clients for [NATS](https://nats.io) from
-[AsyncAPI 3.0](https://www.asyncapi.com/docs/reference/specification/v3.0.0) documents,
+[AsyncAPI 3.0 and 3.1](https://www.asyncapi.com/docs/reference/specification/latest) documents,
 including the [NATS bindings](https://github.com/asyncapi/bindings/blob/master/nats/README.md).
 
 ## Install
@@ -141,8 +141,11 @@ Request/reply is not stored: `Request` goes over core NATS, and a `Server` shoul
 
 | AsyncAPI | Go |
 |---|---|
-| `components.schemas`, message payloads | structs, enums (typed string constants), aliases |
-| channel `address` with `{params}` | `XxxChannel` (`broker.Channel[T]`) and an `XxxParams(...)` helper; parameter `enum`s become `Allowed` |
+| `components.schemas`, message payloads | structs, enums (typed string and number constants), aliases |
+| `allOf` | one merged struct; members that conflict are an error |
+| `schemaFormat` + `schema` | the inner schema, for the AsyncAPI and JSON Schema draft-07 formats |
+| message and operation `traits` | merged into the message or operation |
+| channel `address` with `{params}` | `XxxChannel` (`broker.Channel[T]`) and an `XxxParams(...)` helper; parameter `enum`s become `Allowed`, `default`s become `Defaults` |
 | `send` operation | `Producer` method calling `broker.Publish` |
 | `send` + `reply` | `Client` method calling `broker.Request` |
 | `receive` operation | `Consumer` method calling `broker.Subscribe`, with `broker.Queue` when `bindings.nats.queue` is set |
@@ -181,10 +184,33 @@ package. The rest of the schema is not checked against your type, so it has to d
 same JSON itself. `x-go-type` next to a `$ref` is ignored: put it on the schema the
 `$ref` points to.
 
+## Errors and warnings
+
+Generation fails rather than producing code that does not match the document:
+
+- documents that are not valid AsyncAPI 3.0 or 3.1: missing `info` fields, unknown fields,
+  parameters that do not match the address, operation messages that are not on the channel
+- `servers` without a NATS server, unless only the `models` part is selected
+- other `schemaFormat`s, such as Avro or Protobuf
+- a `reply.address`, or a reply channel with a fixed address: replies always go to the
+  reply subject NATS provides with the request, so use `address: null`
+- names that cannot be told apart in Go, such as two operations `foo-bar` and `foo_bar`
+
+What is generated with less detail than the document has is printed as a warning on
+stderr, and generation continues:
+
+- `oneOf` and `anyOf` as `json.RawMessage`
+- `not`, `if` and `additionalProperties` next to `properties` are ignored
+- parameter `location` is ignored; values are passed in the parameters
+- a non-JSON `contentType` needs a codec set with `broker.WithCodec`
+
+Other validation keywords, such as `minimum` or `pattern`, are not enforced, and a `const`
+is only documented on its field.
+
 ## Status
 
 Early MVP. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and current limitations
-(one message type per channel, no `oneOf`/`allOf`, local `$ref`s only).
+(one message type per channel, untyped `oneOf`/`anyOf`, local `$ref`s only).
 
 ## Development
 

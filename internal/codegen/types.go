@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"maps"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/jnszkr/go-asyncapi/internal/spec"
 )
@@ -19,9 +23,15 @@ type typeDecl struct {
 	Doc     string
 	Kind    string // "struct", "enum", "alias"
 	Fields  []field
-	Under   string   // underlying type for "enum" and "alias"
-	Values  []string // Go literals for "enum"
+	Under   string // underlying type for "enum" and "alias"
+	Values  []enumValue
 	Imports []string
+}
+
+// enumValue is a constant of an "enum" type.
+type enumValue struct {
+	Name    string // appended to the type's name
+	Literal string // Go literal
 }
 
 type field struct {
@@ -39,14 +49,37 @@ type typeSet struct {
 	byName  map[string]*typeDecl
 	byRef   map[string]string // component schema ref → Go type name
 	imports map[string]bool
+	onWarn  func(string)
+	warned  map[string]bool
 }
 
-func newTypeSet(doc *spec.Document) *typeSet {
+func newTypeSet(doc *spec.Document, onWarn func(string)) *typeSet {
 	return &typeSet{
 		doc:     doc,
 		byName:  map[string]*typeDecl{},
 		byRef:   map[string]string{},
 		imports: map[string]bool{},
+		onWarn:  onWarn,
+		warned:  map[string]bool{},
+	}
+}
+
+// warn reports something the generated code cannot express, once.
+func (ts *typeSet) warn(format string, args ...any) {
+	w := fmt.Sprintf(format, args...)
+	if ts.onWarn != nil && !ts.warned[w] {
+		ts.onWarn(w)
+	}
+	ts.warned[w] = true
+}
+
+// warnIgnored warns about keywords that have no effect on the generated type.
+func (ts *typeSet) warnIgnored(s *spec.Schema, name string) {
+	if s.Not != nil {
+		ts.warn("%s: not is ignored", name)
+	}
+	if s.If != nil {
+		ts.warn("%s: if is ignored", name)
 	}
 }
 
@@ -72,6 +105,12 @@ func (ts *typeSet) add(d *typeDecl) {
 // nameHint if the schema is inline. Primitive inline schemas get an alias so
 // every message payload has a stable, named type.
 func (ts *typeSet) namedType(s *spec.Schema, nameHint string) (string, error) {
+	if s != nil {
+		var err error
+		if s, err = s.Unwrap(); err != nil {
+			return "", err
+		}
+	}
 	if s != nil && strings.HasPrefix(s.Ref, componentSchemaPrefix) {
 		return ts.goType(s, nameHint)
 	}
@@ -92,6 +131,10 @@ func (ts *typeSet) namedType(s *spec.Schema, nameHint string) (string, error) {
 func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 	if s == nil {
 		return "any", nil
+	}
+	s, err := s.Unwrap()
+	if err != nil {
+		return "", err
 	}
 	if s.Ref != "" {
 		if !strings.HasPrefix(s.Ref, componentSchemaPrefix) {
@@ -121,8 +164,22 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 		return ts.mappedType(s)
 	}
 
-	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 || len(s.AllOf) > 0 {
-		// TODO(phase 2): composite schemas.
+	if len(s.AllOf) > 0 {
+		merged, err := ts.flatten(s, 0)
+		if err != nil {
+			return "", err
+		}
+		return ts.goType(merged, nameHint)
+	}
+	ts.warnIgnored(s, nameHint)
+
+	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
+		// TODO(phase 2): typed unions.
+		keyword := "oneOf"
+		if len(s.OneOf) == 0 {
+			keyword = "anyOf"
+		}
+		ts.warn("%s: %s is generated as json.RawMessage", nameHint, keyword)
 		ts.imports["encoding/json"] = true
 		return "json.RawMessage", nil
 	}
@@ -167,20 +224,21 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 			return "[]byte", nil
 		}
 		return "string", nil
-	case "integer":
-		switch s.Format {
-		case "int32":
-			return "int32", nil
+	case "integer", "number":
+		if len(s.Enum) > 0 {
+			name := ts.uniqueName(nameHint)
+			return name, ts.declare(s, name)
 		}
-		return "int64", nil
-	case "number":
-		if s.Format == "float" {
-			return "float32", nil
-		}
-		return "float64", nil
+		return numericType(s), nil
 	case "boolean":
+		if len(s.Enum) > 0 {
+			ts.warn("%s: enum is only generated for strings and numbers", nameHint)
+		}
 		return "bool", nil
 	case "":
+		if len(s.Enum) > 0 {
+			ts.warn("%s: enum with values of different types is generated as any", nameHint)
+		}
 		return "any", nil
 	}
 	return "", fmt.Errorf("unsupported schema type %q", s.Type)
@@ -188,6 +246,14 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 
 // declare emits a named type for a resolved (ref-free) schema.
 func (ts *typeSet) declare(s *spec.Schema, name string) error {
+	if len(s.AllOf) > 0 && !isMapped(s) {
+		merged, err := ts.flatten(s, 0)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		s = merged
+	}
+	ts.warnIgnored(s, name)
 	d := &typeDecl{Name: name, Doc: schemaDoc(s)}
 	// Reserve the name before descending into properties.
 	ts.add(d)
@@ -213,7 +279,14 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 			props = append(props, p)
 		}
 		sort.Strings(props)
+		if ap, ok := s.AdditionalProperties.(map[string]any); ok && len(ap) > 0 {
+			ts.warn("%s: additionalProperties is ignored on an object with properties", name)
+		}
+		fields := map[string]bool{}
 		for _, p := range props {
+			if !validJSONName(p) {
+				return fmt.Errorf("%s: property %q cannot be written in a json struct tag", name, p)
+			}
 			ps := s.Properties[p]
 			t, err := ts.goType(ps, name+exportName(p))
 			if err != nil {
@@ -224,17 +297,21 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 				t = "*" + t
 			}
 			d.Fields = append(d.Fields, field{
-				Name: exportName(p), JSONName: p, Type: t, Required: req, Doc: schemaDoc(ps),
+				Name: uniqueIn(fields, exportName(p)), JSONName: p, Type: t, Required: req, Doc: schemaDoc(ps),
 			})
 		}
-	case schemaType(s) == "string" && len(s.Enum) > 0:
+	case len(s.Enum) > 0 && slices.Contains([]string{"string", "integer", "number"}, schemaType(s)):
 		d.Kind, d.Under = "enum", "string"
+		if schemaType(s) != "string" {
+			d.Under = numericType(s)
+		}
+		values := map[string]bool{}
 		for _, v := range s.Enum {
-			str, ok := v.(string)
+			lit, ok := enumLiteral(schemaType(s), v)
 			if !ok {
-				return fmt.Errorf("%s: non-string enum value %v", name, v)
+				return fmt.Errorf("%s: enum value %v is not of type %s", name, v, schemaType(s))
 			}
-			d.Values = append(d.Values, str)
+			d.Values = append(d.Values, enumValue{Name: uniqueIn(values, exportName(fmt.Sprint(v))), Literal: lit})
 		}
 	default:
 		t, err := ts.goType(s, name+"Value")
@@ -244,6 +321,206 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 		d.Kind, d.Under = "alias", t
 	}
 	return nil
+}
+
+// flatten merges the members of an allOf into one schema. An allOf of a
+// single member and nothing else is that member, so a $ref keeps its type.
+func (ts *typeSet) flatten(s *spec.Schema, depth int) (*spec.Schema, error) {
+	if depth == 32 {
+		return nil, fmt.Errorf("allOf nested too deep (cycle?)")
+	}
+	bare := s.Type == "" && len(s.Properties) == 0 && len(s.Required) == 0 && s.Items == nil &&
+		len(s.Enum) == 0 && s.Const == nil && len(s.OneOf) == 0 && len(s.AnyOf) == 0 && s.AdditionalProperties == nil
+	if len(s.AllOf) == 1 && bare {
+		return s.AllOf[0], nil
+	}
+	out := *s
+	out.AllOf = nil
+	out.Properties = maps.Clone(s.Properties)
+	for _, m := range s.AllOf {
+		member, _, err := ts.doc.ResolveSchema(m)
+		if err != nil {
+			return nil, err
+		}
+		for len(member.AllOf) > 0 {
+			if member, err = ts.flatten(member, depth+1); err != nil {
+				return nil, err
+			}
+			if member, _, err = ts.doc.ResolveSchema(member); err != nil {
+				return nil, err
+			}
+		}
+		if isMapped(member) {
+			return nil, fmt.Errorf("allOf member with x-go-type cannot be merged")
+		}
+		if err := mergeSchema(&out, member); err != nil {
+			return nil, err
+		}
+	}
+	return &out, nil
+}
+
+// mergeSchema adds an allOf member to out. A member can only narrow a schema,
+// so keywords that differ cannot both be expressed by one Go type.
+func mergeSchema(out, m *spec.Schema) error {
+	for _, kw := range []struct {
+		name     string
+		dst, src any
+		set      func()
+	}{
+		{"type", out.Type, m.Type, func() { out.Type = m.Type }},
+		{"format", out.Format, m.Format, func() { out.Format = m.Format }},
+		{"items", out.Items, m.Items, func() { out.Items = m.Items }},
+		{"enum", out.Enum, m.Enum, func() { out.Enum = m.Enum }},
+		{"const", out.Const, m.Const, func() { out.Const = m.Const }},
+		{"additionalProperties", out.AdditionalProperties, m.AdditionalProperties, func() { out.AdditionalProperties = m.AdditionalProperties }},
+	} {
+		switch {
+		case isZero(kw.src):
+		case isZero(kw.dst):
+			kw.set()
+		case !reflect.DeepEqual(kw.dst, kw.src):
+			return fmt.Errorf("allOf: conflicting %s: %v and %v", kw.name, kw.dst, kw.src)
+		}
+	}
+	for k, v := range m.Properties {
+		if have, ok := out.Properties[k]; ok && !reflect.DeepEqual(have, v) {
+			return fmt.Errorf("allOf: conflicting definitions of property %q", k)
+		}
+		if out.Properties == nil {
+			out.Properties = map[string]*spec.Schema{}
+		}
+		out.Properties[k] = v
+	}
+	out.Required = append(out.Required, m.Required...)
+	out.OneOf = append(out.OneOf, m.OneOf...)
+	out.AnyOf = append(out.AnyOf, m.AnyOf...)
+	if out.Not == nil {
+		out.Not = m.Not
+	}
+	if out.If == nil {
+		out.If = m.If
+	}
+	if out.Description == "" {
+		out.Description = m.Description
+	}
+	if out.Title == "" {
+		out.Title = m.Title
+	}
+	return nil
+}
+
+func isZero(v any) bool {
+	return v == nil || reflect.ValueOf(v).IsZero()
+}
+
+// numericType returns the Go type of an integer or number schema.
+func numericType(s *spec.Schema) string {
+	switch {
+	case schemaType(s) == "integer" && s.Format == "int32":
+		return "int32"
+	case schemaType(s) == "integer":
+		return "int64"
+	case s.Format == "float":
+		return "float32"
+	}
+	return "float64"
+}
+
+// enumLiteral returns the Go literal of an enum value of the given type.
+func enumLiteral(typ string, v any) (string, bool) {
+	switch v := v.(type) {
+	case string:
+		return strconv.Quote(v), typ == "string"
+	case int, int64, uint64:
+		return fmt.Sprint(v), typ == "integer" || typ == "number"
+	case float64:
+		return strconv.FormatFloat(v, 'g', -1, 64), typ == "number"
+	}
+	return "", false
+}
+
+// literalType returns the schema type of a value in a document, or "".
+func literalType(v any) string {
+	switch v.(type) {
+	case string:
+		return "string"
+	case int, int64, uint64:
+		return "integer"
+	case float64:
+		return "number"
+	case bool:
+		return "boolean"
+	}
+	return ""
+}
+
+// uniqueIn returns name, with a numeric suffix if it is already in used, and
+// adds the result to used.
+func uniqueIn(used map[string]bool, name string) string {
+	unique := name
+	for i := 2; used[unique]; i++ {
+		unique = name + strconv.Itoa(i)
+	}
+	used[unique] = true
+	return unique
+}
+
+// validJSONName reports whether encoding/json honours name in a struct tag.
+func validJSONName(name string) bool {
+	if name == "" || name == "-" {
+		return false
+	}
+	for _, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", r) {
+			return false
+		}
+	}
+	return true
+}
+
+// breakRecursion makes fields pointers where structs would otherwise contain
+// themselves, which Go does not allow even when the field is required.
+func breakRecursion(decls []*typeDecl) {
+	byName := map[string]*typeDecl{}
+	for _, d := range decls {
+		byName[d.Name] = d
+	}
+	target := func(t string) *typeDecl {
+		d := byName[t]
+		for range decls {
+			if d == nil || d.Kind != "alias" {
+				break
+			}
+			d = byName[d.Under]
+		}
+		return d
+	}
+	const visiting, done = 1, 2
+	state := map[*typeDecl]int{}
+	var visit func(d *typeDecl)
+	visit = func(d *typeDecl) {
+		state[d] = visiting
+		for i := range d.Fields {
+			f := &d.Fields[i]
+			t := target(f.Type)
+			if t == nil || t.Kind != "struct" {
+				continue
+			}
+			switch state[t] {
+			case visiting:
+				f.Type = "*" + f.Type
+			case 0:
+				visit(t)
+			}
+		}
+		state[d] = done
+	}
+	for _, d := range decls {
+		if state[d] == 0 {
+			visit(d)
+		}
+	}
 }
 
 func isMapped(s *spec.Schema) bool {
@@ -314,20 +591,41 @@ func typePackages(e ast.Expr, pkgs map[string]bool) bool {
 }
 
 func schemaType(s *spec.Schema) string {
-	if s.Type == "" && len(s.Properties) > 0 {
+	switch {
+	case s.Type != "":
+		return s.Type
+	case len(s.Properties) > 0:
 		return "object"
+	case s.Const != nil:
+		return literalType(s.Const)
+	case len(s.Enum) > 0:
+		t := literalType(s.Enum[0])
+		for _, v := range s.Enum {
+			if literalType(v) != t {
+				return ""
+			}
+		}
+		return t
 	}
-	return s.Type
+	return ""
 }
 
 func schemaDoc(s *spec.Schema) string {
 	if s == nil {
 		return ""
 	}
-	if s.Description != "" {
-		return s.Description
+	doc := s.Description
+	if doc == "" {
+		doc = s.Title
 	}
-	return s.Title
+	if s.Const != nil {
+		value := fmt.Sprint(s.Const)
+		if str, ok := s.Const.(string); ok {
+			value = strconv.Quote(str)
+		}
+		doc = strings.TrimSpace(doc + "\nMust be " + value + ".")
+	}
+	return doc
 }
 
 // needsPointer reports whether an optional field of type t should be a
