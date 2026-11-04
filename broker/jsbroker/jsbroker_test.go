@@ -268,6 +268,37 @@ func TestInterceptorOrderAndContext(t *testing.T) {
 	}
 }
 
+// TestClientInterceptorDecidesAck checks that the error a transport-agnostic
+// interceptor returns settles the message.
+func TestClientInterceptorDecidesAck(t *testing.T) {
+	js := setup(t)
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy, AckWait: 200 * time.Millisecond})
+	var attempts atomic.Int32
+	c := broker.New(jsbroker.New(js), broker.WithReceiveInterceptors(func(next broker.ReceiveFunc) broker.ReceiveFunc {
+		return func(ctx context.Context, m *broker.Message) error {
+			_ = next(ctx, m)
+			return nil
+		}
+	}))
+	sub, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error {
+		attempts.Add(1)
+		return errors.New("fails")
+	}, jsbroker.From(cons))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	if err := broker.Publish(context.Background(), c, events, broker.Params{"kind": "a"}, event{}); err != nil {
+		t.Fatal(err)
+	}
+	settled(t, cons)
+	time.Sleep(500 * time.Millisecond) // longer than AckWait
+	if n := attempts.Load(); n != 1 {
+		t.Errorf("handler attempts = %d, want 1", n)
+	}
+}
+
 func TestSubscribeWithoutConsumerFails(t *testing.T) {
 	c := broker.New(jsbroker.New(setup(t)))
 	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil })

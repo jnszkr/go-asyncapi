@@ -76,7 +76,11 @@ type Client struct {
 	onError        func(error)
 	requestTimeout time.Duration
 	validator      Validator
-	compiled       sync.Map // schema string → func([]byte) error
+
+	publishInterceptors []PublishInterceptor
+	requestInterceptors []RequestInterceptor
+	receiveInterceptors []ReceiveInterceptor
+	compiled            sync.Map // schema string → func([]byte) error
 }
 
 // Option configures a Client.
@@ -136,6 +140,19 @@ func newClient(transport any, opts []Option) *Client {
 	c.sub, _ = transport.(Subscriber)
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.pub != nil {
+		c.pub = chain(PublishFunc(c.pub.Publish), c.publishInterceptors)
+	}
+	if req := c.req; req != nil {
+		// Replies get a Header for the interceptors, as received messages do.
+		c.req = chain(RequestFunc(func(ctx context.Context, m *Message) (*Message, error) {
+			r, err := req.Request(ctx, m)
+			if r != nil && r.Header == nil {
+				r.Header = Header{}
+			}
+			return r, err
+		}), c.requestInterceptors)
 	}
 	return c
 }
@@ -340,9 +357,6 @@ type channelSubject interface {
 
 func decode[T any](c *Client, ch Channel[T], m *Message) (Received[T], error) {
 	r := Received[T]{Subject: m.Subject, Header: m.Header}
-	if r.Header == nil {
-		r.Header = Header{}
-	}
 	var err error
 	if r.Params, err = ch.ParseSubject(m.Subject); err != nil {
 		return r, fmt.Errorf("%w: %w", ErrMalformed, err)
@@ -415,7 +429,13 @@ func (c *Client) subscribe(subject string, opts []SubOption, h func(context.Cont
 		opt(&cfg)
 	}
 	cfg.Subject = subject
-	return c.sub.Subscribe(cfg, h)
+	receive := chain(ReceiveFunc(h), c.receiveInterceptors)
+	return c.sub.Subscribe(cfg, func(ctx context.Context, m *Message) error {
+		if m.Header == nil {
+			m.Header = Header{}
+		}
+		return receive(ctx, m)
+	})
 }
 
 // respondError sends err back to the requester. The request counts as

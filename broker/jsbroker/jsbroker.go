@@ -23,7 +23,9 @@
 // broker.ErrMalformed. An Interceptor can change that outcome or settle the
 // message itself, e.g. to move it to a dead letter queue. A failed ack is not
 // reported, and the server redelivers the message after its ack wait; an
-// Interceptor settling the message itself gets the error. Consume errors go to
+// Interceptor settling the message itself gets the error. Interceptors here see
+// the jetstream.Msg; those of broker.WithReceiveInterceptors, which work on every
+// transport, see a broker.Message and run inside them. Consume errors go to
 // the jetstream.ConsumeErrHandler among the consume options, if any. Publish
 // waits for the stream's acknowledgement.
 //

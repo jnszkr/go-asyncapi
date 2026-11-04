@@ -147,8 +147,9 @@ consumers := jsbroker.ConsumerFunc(func(cfg broker.SubConfig) (jetstream.Consume
 orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.FromFactory(consumers))
 ```
 
-`FromFactory` also takes interceptors, which wrap the delivery of each message and see the
-`jetstream.Msg` and the handler's error. Returning a different error changes what happens to
+`FromFactory` also takes interceptors specific to JetStream, which wrap the delivery of each
+message and see the `jetstream.Msg` and the handler's error (see also
+[Interceptors](#interceptors)). Returning a different error changes what happens to
 the message, and calling `msg.NakWithDelay`, `msg.Term` or the like settles it directly. This
 one moves a message to a dead letter queue once it has failed five times, or at once if it
 cannot be decoded. Use `jsbroker.Existing` to intercept a consumer you already have:
@@ -242,6 +243,43 @@ validator next to a `Producer` without one checks incoming messages alone. A `Cl
 Responder errors are sent back using the `Nats-Service-Error` / `Nats-Service-Error-Code`
 headers and surface as `*broker.RemoteError` on the requesting side. Use
 `broker.WithErrorCodec` to change that (see below).
+
+### Interceptors
+
+Interceptors wrap what a generated type sends and receives, on every transport and without
+writing a transport of your own. Pass them as options to the generated constructors, the
+first being the outermost:
+
+| Option | Wraps | For example |
+|---|---|---|
+| `broker.WithPublishInterceptors` | publishing, including the replies of a `Server` | adding headers |
+| `broker.WithRequestInterceptors` | sending a request and waiting for its reply | authentication, retries |
+| `broker.WithReceiveInterceptors` | decoding and handling a received message, including requests | tracing, dead letter queues |
+
+```go
+deadLetter := func(next broker.ReceiveFunc) broker.ReceiveFunc {
+	return func(ctx context.Context, m *broker.Message) error {
+		err := next(ctx, m)
+		if err == nil {
+			return nil
+		}
+		return nc.PublishMsg(&nats.Msg{Subject: "dead." + m.Subject, Header: nats.Header(m.Header), Data: m.Data})
+	}
+}
+consumer := orders.NewConsumer(natsbroker.New(nc), broker.WithReceiveInterceptors(deadLetter))
+
+authenticate := func(next broker.RequestFunc) broker.RequestFunc {
+	return func(ctx context.Context, m *broker.Message) (*broker.Message, error) {
+		m.Header.Set("Authorization", token(ctx))
+		return next(ctx, m)
+	}
+}
+client := orders.NewClient(natsbroker.New(nc), broker.WithRequestInterceptors(authenticate))
+```
+
+Core NATS has no redelivery, so the error a receive interceptor returns goes nowhere there.
+On JetStream it decides what happens to the message, as described above. A `Server` sends
+handler errors to the requester, so its receive interceptors see `nil` for those.
 
 ### Bringing your own transport
 
