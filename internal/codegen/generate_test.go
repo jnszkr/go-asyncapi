@@ -10,6 +10,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -107,21 +108,15 @@ func typecheck(t *testing.T, src string) {
 	}
 }
 
-func TestModelsOnly(t *testing.T) {
-	tests := map[string]struct {
-		src  string
-		want []string
-	}{
-		"operations are dropped": {
-			src: `
+const allOperations = `
 asyncapi: 3.0.0
 info: {title: t, version: "1"}
 channels:
-  orders:
-    address: orders.{region}
+  events:
+    address: events.{region}
     parameters: {region: {enum: [eu]}}
     messages:
-      order:
+      event:
         headers:
           type: object
           properties: {trace: {type: string}}
@@ -129,54 +124,124 @@ channels:
           type: object
           properties:
             at: {type: string, format: date-time}
+  ticks:
+    address: ticks
+    messages:
+      tick:
+        payload: {type: string}
+  lookups:
+    address: lookups
+    messages:
+      lookup:
+        payload: {type: string}
+  answers:
+    address: null
+    messages:
+      answer:
+        payload: {type: string}
 operations:
-  sendOrder:
+  sendEvent:
     action: send
-    channel: {$ref: '#/channels/orders'}
-  onOrder:
+    channel: {$ref: '#/channels/events'}
+  onTick:
     action: receive
-    channel: {$ref: '#/channels/orders'}
-`,
-			want: []string{"type Order struct", `OrderHeaderTrace = "trace"`, `"time"`},
-		},
-		"nothing to import": {
-			src: `
-asyncapi: 3.0.0
-info: {title: t, version: "1"}
-components:
-  schemas:
-    Name: {type: string}
-`,
-			want: []string{"type Name = string"},
+    channel: {$ref: '#/channels/ticks'}
+  getLookup:
+    action: send
+    channel: {$ref: '#/channels/lookups'}
+    reply: {channel: {$ref: '#/channels/answers'}}
+  serveLookup:
+    action: receive
+    channel: {$ref: '#/channels/lookups'}
+    reply: {channel: {$ref: '#/channels/answers'}}
+`
+
+func TestParts(t *testing.T) {
+	models := []string{"type Event struct", `EventHeaderTrace = "trace"`, `"time"`, "type Tick = string", "type Lookup = string", "type Answer = string"}
+	producer := []string{"type Producer struct", "func NewProducer(", "func (c *Producer) SendEvent(", "EventsChannel", "EventsParams"}
+	consumer := []string{"type Consumer struct", "func NewConsumer(", "func (c *Consumer) OnTick(", "TicksChannel", "OnTickEndpoint"}
+	client := []string{"type Client struct", "func NewClient(", "func (c *Client) GetLookup(", "LookupsChannel"}
+	server := []string{"type Server struct", "func NewServer(", "func (c *Server) ServeLookup(", "LookupsChannel", "ServeLookupEndpoint"}
+
+	tests := map[string]struct {
+		parts   []Part
+		want    [][]string
+		unwant  [][]string
+		context bool
+	}{
+		"default":  {nil, [][]string{producer, consumer, client, server}, nil, true},
+		"all":      {allParts, [][]string{producer, consumer, client, server}, nil, true},
+		"models":   {[]Part{PartModels}, nil, [][]string{producer, consumer, client, server, {"broker"}}, false},
+		"producer": {[]Part{PartProducer}, [][]string{producer}, [][]string{consumer, client, server}, true},
+		"consumer": {[]Part{PartConsumer}, [][]string{consumer}, [][]string{producer, client, server}, false},
+		"client":   {[]Part{PartClient}, [][]string{client}, [][]string{producer, consumer, {"type Server struct", "ServeLookupEndpoint"}}, true},
+		"server":   {[]Part{PartServer}, [][]string{server}, [][]string{producer, consumer, {"type Client struct"}}, false},
+		"consumer and client": {
+			[]Part{PartClient, PartConsumer}, [][]string{consumer, client}, [][]string{producer, {"type Server struct"}}, true,
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			doc, err := spec.Parse([]byte(tc.src))
+			doc, err := spec.Parse([]byte(allOperations))
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := Generate(doc, Options{Package: "p", ModelsOnly: true})
+			got, err := Generate(doc, Options{Package: "p", Parts: tc.parts})
 			if err != nil {
 				t.Fatal(err)
 			}
 			out := string(got)
-			for _, want := range tc.want {
+			for _, want := range append(slices.Concat(tc.want...), models...) {
 				if !strings.Contains(out, want) {
 					t.Errorf("generated code does not contain %q:\n%s", want, out)
 				}
 			}
-			for _, unwanted := range []string{"broker", "Client", "Channel", "Endpoint", "Params", "context"} {
+			for _, unwanted := range slices.Concat(tc.unwant...) {
+				// LookupsChannel and friends are shared, so only names
+				// exclusive to an unselected part are meaningful here.
+				if slices.Contains(slices.Concat(tc.want...), unwanted) {
+					continue
+				}
 				if strings.Contains(out, unwanted) {
 					t.Errorf("generated code contains %q:\n%s", unwanted, out)
 				}
+			}
+			if strings.Contains(out, `"context"`) != tc.context {
+				t.Errorf("imports context = %v, want %v:\n%s", !tc.context, tc.context, out)
 			}
 			typecheck(t, out)
 		})
 	}
 }
 
-func TestModelsOnlyStillValidatesOperations(t *testing.T) {
+func TestPartWithoutOperationsIsLeftOut(t *testing.T) {
+	doc, err := spec.Parse([]byte(`
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+components:
+  schemas:
+    Name: {type: string}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Generate(doc, Options{Package: "p", Parts: []Part{PartProducer}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(got)
+	if !strings.Contains(out, "type Name = string") {
+		t.Errorf("generated code does not contain the model:\n%s", out)
+	}
+	for _, unwanted := range []string{"broker", "Producer"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("generated code contains %q:\n%s", unwanted, out)
+		}
+	}
+	typecheck(t, out)
+}
+
+func TestModelsStillValidateOperations(t *testing.T) {
 	doc, err := spec.Parse([]byte(`
 asyncapi: 3.0.0
 info: {title: t, version: "1"}
@@ -190,8 +255,52 @@ operations:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Generate(doc, Options{Package: "p", ModelsOnly: true}); err == nil || !strings.Contains(err.Error(), "wildcards") {
+	if _, err := Generate(doc, Options{Package: "p", Parts: []Part{PartModels}}); err == nil || !strings.Contains(err.Error(), "wildcards") {
 		t.Fatalf("got error %v, want it to contain %q", err, "wildcards")
+	}
+}
+
+func TestTypeNameClash(t *testing.T) {
+	const src = `
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  c:
+    address: a
+    messages: {m: {payload: {type: string}}}
+operations:
+  o: {action: receive, channel: {$ref: '#/channels/c'}}
+components:
+  schemas:
+    Consumer: {type: string}
+`
+	doc, err := spec.Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Generate(doc, Options{Package: "p"}); err == nil || !strings.Contains(err.Error(), "clashes") {
+		t.Fatalf("got error %v, want it to contain %q", err, "clashes")
+	}
+	// Without the consumer part the schema's name is free.
+	got, err := Generate(doc, Options{Package: "p", Parts: []Part{PartModels}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typecheck(t, string(got))
+}
+
+func TestParseParts(t *testing.T) {
+	got, err := ParseParts("producer, client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []Part{PartProducer, PartClient}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	for _, bad := range []string{"", "producer,", "publisher"} {
+		if _, err := ParseParts(bad); err == nil || !strings.Contains(err.Error(), "unknown part") {
+			t.Errorf("%q: got error %v, want it to contain %q", bad, err, "unknown part")
+		}
 	}
 }
 

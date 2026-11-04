@@ -1,4 +1,4 @@
-// Command asyncapi-gen generates a typed Go NATS client from an AsyncAPI document.
+// Command asyncapi-gen generates typed Go NATS code from an AsyncAPI document.
 package main
 
 import (
@@ -23,7 +23,7 @@ func run() error {
 	out := flag.String("out", "", "output directory for the generated package")
 	pkg := flag.String("package", "", "name of the generated package (default: base name of -out)")
 	file := flag.String("file", "asyncapi.gen.go", "name of the generated file")
-	modelsOnly := flag.Bool("models-only", false, "generate only types and header-name constants, without channels or a client")
+	generate := flag.String("generate", "models,producer,consumer,client,server", "comma-separated parts to generate; models are always included")
 	flag.Parse()
 
 	if *specPath == "" || *out == "" {
@@ -38,11 +38,16 @@ func run() error {
 		*pkg = filepath.Base(abs)
 	}
 
+	parts, err := codegen.ParseParts(*generate)
+	if err != nil {
+		return fmt.Errorf("-generate: %w", err)
+	}
+
 	doc, err := spec.LoadFile(*specPath)
 	if err != nil {
 		return err
 	}
-	src, err := codegen.Generate(doc, codegen.Options{Package: *pkg, ModelsOnly: *modelsOnly})
+	src, err := codegen.Generate(doc, codegen.Options{Package: *pkg, Parts: parts})
 	if err != nil {
 		return err
 	}

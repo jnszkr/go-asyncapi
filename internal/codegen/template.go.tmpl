@@ -4,12 +4,12 @@
 {{- end}}
 
 package {{.Package}}
-{{if or .Imports (not .ModelsOnly)}}
+{{if or .Imports .Ops}}
 import (
 {{- range .Imports}}
 	"{{.}}"
 {{- end}}
-{{- if not .ModelsOnly}}
+{{- if .Ops}}
 
 	"github.com/jnszkr/go-asyncapi/broker"
 {{- end}}
@@ -64,34 +64,34 @@ func {{.Name}}Params({{range $i, $p := .Params}}{{if $i}}, {{end}}{{$p.Arg}}{{en
 	return broker.Params{ {{- range $i, $p := .Params}}{{if $i}}, {{end}}{{printf "%q" $p.Key}}: {{$p.Arg}}{{end -}} }
 }
 {{end}}{{end}}
-{{- if not .ModelsOnly}}
-// Client is a typed client for {{if .Title}}{{.Title}}{{else}}the AsyncAPI document{{end}}. Each method is a
+{{- range $api := .APIs}}
+// {{.Name}} {{.Role}} {{if $.Title}}{{$.Title}}{{else}}the AsyncAPI document{{end}}. Each method is a
 // thin wrapper around the generic functions of package broker, which can
 // also be called directly with the embedded *broker.Client.
-type Client struct {
+type {{.Name}} struct {
 	*broker.Client
 }
 
-// NewClient returns a Client on top of b, e.g. natsbroker.New(nc).
-func NewClient(b broker.Broker, opts ...broker.Option) *Client {
-	return &Client{Client: broker.New(b, opts...)}
+// New{{.Name}} returns a {{.Name}} on top of b, e.g. natsbroker.New(nc).
+func New{{.Name}}(b broker.Broker, opts ...broker.Option) *{{.Name}} {
+	return &{{.Name}}{Client: broker.New(b, opts...)}
 }
 {{range .Ops}}
 {{template "opdoc" .}}
 {{- if and .IsSend (not .Reply)}}
-func (c *Client) {{.Name}}(ctx context.Context, {{template "params" .}}msg {{.Message.Type}}, opts ...broker.MsgOption) error {
+func (c *{{$api.Name}}) {{.Name}}(ctx context.Context, {{template "params" .}}msg {{.Message.Type}}, opts ...broker.MsgOption) error {
 	return broker.Publish(ctx, c.Client, {{.Channel.Name}}Channel, {{template "paramsArg" .}}, msg, opts...)
 }
 {{- else if .IsSend}}
-func (c *Client) {{.Name}}(ctx context.Context, {{template "params" .}}req {{.Message.Type}}, opts ...broker.MsgOption) ({{.Reply.Type}}, error) {
+func (c *{{$api.Name}}) {{.Name}}(ctx context.Context, {{template "params" .}}req {{.Message.Type}}, opts ...broker.MsgOption) ({{.Reply.Type}}, error) {
 	return broker.Request[{{.Message.Type}}, {{.Reply.Type}}](ctx, c.Client, {{.Channel.Name}}Channel, {{template "paramsArg" .}}, req, opts...)
 }
 {{- else if not .Reply}}
-func (c *Client) {{.Name}}(h broker.Handler[{{.Message.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
+func (c *{{$api.Name}}) {{.Name}}(h broker.Handler[{{.Message.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
 	return broker.Subscribe(c.Client, {{.Channel.Name}}Channel, h, {{template "subOpts" .}})
 }
 {{- else}}
-func (c *Client) {{.Name}}(h broker.Responder[{{.Message.Type}}, {{.Reply.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
+func (c *{{$api.Name}}) {{.Name}}(h broker.Responder[{{.Message.Type}}, {{.Reply.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
 	return broker.Respond(c.Client, {{.Channel.Name}}Channel, h, {{template "subOpts" .}})
 }
 {{- end}}

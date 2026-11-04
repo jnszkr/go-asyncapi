@@ -32,8 +32,8 @@ The generator only emits what is specific to a document:
 |----------------------------------|------------------------------------------------------------------|
 | `components.schemas.*`, message payloads | structs / named types (JSON tags, `omitempty` for optional fields) |
 | channel `address` + `parameters` | `XxxChannel = broker.Channel[T]{Address, Allowed}` and `XxxParams(...) broker.Params` |
-| `send` / `receive` operations    | one-line `Client` methods calling `Publish` / `Subscribe` (`Queue` from the NATS binding) |
-| `send` / `receive` + `reply`     | one-line `Client` methods calling `Request` / `Respond`          |
+| `send` / `receive` operations    | one-line `Producer` / `Consumer` methods calling `Publish` / `Subscribe` (`Queue` from the NATS binding) |
+| `send` / `receive` + `reply`     | one-line `Client` / `Server` methods calling `Request` / `Respond`          |
 | message `headers`                | header-name constants                                            |
 | `contentType`                    | JSON codec by default; `broker.WithCodec` to replace it          |
 

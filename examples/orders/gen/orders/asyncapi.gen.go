@@ -85,7 +85,43 @@ func OrderCreatedParams(region string) broker.Params {
 	return broker.Params{"region": region}
 }
 
-// Client is a typed client for Order Service. Each method is a
+// Producer publishes the messages of Order Service. Each method is a
+// thin wrapper around the generic functions of package broker, which can
+// also be called directly with the embedded *broker.Client.
+type Producer struct {
+	*broker.Client
+}
+
+// NewProducer returns a Producer on top of b, e.g. natsbroker.New(nc).
+func NewProducer(b broker.Broker, opts ...broker.Option) *Producer {
+	return &Producer{Client: broker.New(b, opts...)}
+}
+
+// Operation "publishOrderCreated": send on orders.{region}.created.
+func (c *Producer) PublishOrderCreated(ctx context.Context, params broker.Params, msg Order, opts ...broker.MsgOption) error {
+	return broker.Publish(ctx, c.Client, OrderCreatedChannel, params, msg, opts...)
+}
+
+// Consumer subscribes to the messages of Order Service. Each method is a
+// thin wrapper around the generic functions of package broker, which can
+// also be called directly with the embedded *broker.Client.
+type Consumer struct {
+	*broker.Client
+}
+
+// NewConsumer returns a Consumer on top of b, e.g. natsbroker.New(nc).
+func NewConsumer(b broker.Broker, opts ...broker.Option) *Consumer {
+	return &Consumer{Client: broker.New(b, opts...)}
+}
+
+// Process new orders; instances share the work through a queue group.
+//
+// Operation "onOrderCreated": receive on orders.{region}.created (queue "order-processors").
+func (c *Consumer) OnOrderCreated(h broker.Handler[Order], opts ...broker.SubOption) (broker.Subscription, error) {
+	return broker.Subscribe(c.Client, OrderCreatedChannel, h, append([]broker.SubOption{broker.Queue("order-processors")}, opts...)...)
+}
+
+// Client sends the requests of Order Service. Each method is a
 // thin wrapper around the generic functions of package broker, which can
 // also be called directly with the embedded *broker.Client.
 type Client struct {
@@ -102,19 +138,19 @@ func (c *Client) GetOrderStatus(ctx context.Context, req StatusRequest, opts ...
 	return broker.Request[StatusRequest, StatusReply](ctx, c.Client, OrderStatusChannel, nil, req, opts...)
 }
 
-// Process new orders; instances share the work through a queue group.
-//
-// Operation "onOrderCreated": receive on orders.{region}.created (queue "order-processors").
-func (c *Client) OnOrderCreated(h broker.Handler[Order], opts ...broker.SubOption) (broker.Subscription, error) {
-	return broker.Subscribe(c.Client, OrderCreatedChannel, h, append([]broker.SubOption{broker.Queue("order-processors")}, opts...)...)
+// Server answers the requests of Order Service. Each method is a
+// thin wrapper around the generic functions of package broker, which can
+// also be called directly with the embedded *broker.Client.
+type Server struct {
+	*broker.Client
 }
 
-// Operation "publishOrderCreated": send on orders.{region}.created.
-func (c *Client) PublishOrderCreated(ctx context.Context, params broker.Params, msg Order, opts ...broker.MsgOption) error {
-	return broker.Publish(ctx, c.Client, OrderCreatedChannel, params, msg, opts...)
+// NewServer returns a Server on top of b, e.g. natsbroker.New(nc).
+func NewServer(b broker.Broker, opts ...broker.Option) *Server {
+	return &Server{Client: broker.New(b, opts...)}
 }
 
 // Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").
-func (c *Client) ServeOrderStatus(h broker.Responder[StatusRequest, StatusReply], opts ...broker.SubOption) (broker.Subscription, error) {
+func (c *Server) ServeOrderStatus(h broker.Responder[StatusRequest, StatusReply], opts ...broker.SubOption) (broker.Subscription, error) {
 	return broker.Respond(c.Client, OrderStatusChannel, h, append([]broker.SubOption{broker.Queue("order-status")}, opts...)...)
 }
