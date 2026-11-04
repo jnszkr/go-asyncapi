@@ -116,6 +116,10 @@ type Schema struct {
 	OneOf                []*Schema          `yaml:"oneOf"`
 	AnyOf                []*Schema          `yaml:"anyOf"`
 	AllOf                []*Schema          `yaml:"allOf"`
+	// GoType is the x-go-type extension: an existing Go type to use instead
+	// of generating one. GoTypeImport is the import path of its package.
+	GoType       string `yaml:"x-go-type"`
+	GoTypeImport string `yaml:"x-go-type-import"`
 }
 
 type Components struct {

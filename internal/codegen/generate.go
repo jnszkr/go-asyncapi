@@ -95,7 +95,7 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 	return src, nil
 }
 
-// imports returns the stdlib imports used by the generated file.
+// imports returns the imports used by the generated file, other than broker.
 func imports(m *model) []string {
 	set := map[string]bool{}
 	for _, imp := range m.Imports {

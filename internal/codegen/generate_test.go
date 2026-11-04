@@ -363,3 +363,111 @@ info: {title: t, version: "1"}
 		})
 	}
 }
+
+func TestGoTypeMapping(t *testing.T) {
+	const src = `
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  events:
+    address: events
+    messages:
+      event:
+        payload: {$ref: '#/components/schemas/Event'}
+  addrs:
+    address: addrs
+    messages:
+      addr:
+        payload: {x-go-type: netip.Addr, x-go-type-import: net/netip}
+operations:
+  sendEvent:
+    action: send
+    channel: {$ref: '#/channels/events'}
+  onAddr:
+    action: receive
+    channel: {$ref: '#/channels/addrs'}
+components:
+  schemas:
+    Event:
+      type: object
+      properties:
+        link: {$ref: '#/components/schemas/Link'}
+        timeout: {type: integer, x-go-type: time.Duration, x-go-type-import: time}
+        target: {x-go-type: '*url.URL', x-go-type-import: net/url}
+        name: {type: string, x-go-type: string}
+    Link:
+      type: object
+      x-go-type: url.URL
+      x-go-type-import: net/url
+      properties:
+        href: {type: string}
+    Unused:
+      type: string
+      x-go-type: big.Int
+      x-go-type-import: math/big
+`
+	doc, err := spec.Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each part leaves out other operations' channels, and the imports must
+	// still all be used for the generated code to compile.
+	for _, parts := range [][]Part{nil, {PartModels}, {PartProducer}, {PartConsumer}} {
+		got, err := Generate(doc, Options{Package: "p", Parts: parts})
+		if err != nil {
+			t.Fatal(err)
+		}
+		typecheck(t, string(got))
+	}
+
+	got, err := Generate(doc, Options{Package: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(got)
+	for _, want := range []string{
+		"type Link = url.URL",
+		"type Unused = big.Int",
+		"type Addr = netip.Addr",
+		"Link    *Link",
+		"Timeout *time.Duration",
+		"Target  *url.URL",
+		"Name    *string",
+		`"net/url"`,
+		"broker.Channel[Addr]",
+		"broker.Channel[Event]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "type Link struct") {
+		t.Errorf("generated a struct for a mapped schema:\n%s", out)
+	}
+}
+
+func TestGoTypeErrors(t *testing.T) {
+	tests := map[string]struct{ schema, wantErr string }{
+		"no import":        {`{x-go-type: url.URL}`, "needs x-go-type-import"},
+		"unused import":    {`{x-go-type: string, x-go-type-import: time}`, "exactly one package"},
+		"two packages":     {`{x-go-type: 'map[a.K]b.V', x-go-type-import: a}`, "exactly one package"},
+		"import only":      {`{x-go-type-import: time}`, "without x-go-type"},
+		"not a type":       {`{x-go-type: 'os.Exit(1)', x-go-type-import: os}`, "not a Go type"},
+		"unparsable":       {`{x-go-type: 'a b'}`, "not a Go type"},
+		"bad import path":  {`{x-go-type: a.B, x-go-type-import: 'a"b'}`, "invalid x-go-type-import"},
+		"refers to itself": {`{x-go-type: Thing}`, "refers to itself"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := generate(t, `
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+components:
+  schemas:
+    Thing: `+tc.schema+"\n")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got error %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}

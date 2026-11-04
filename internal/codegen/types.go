@@ -2,6 +2,8 @@ package codegen
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
 	"sort"
 	"strconv"
 	"strings"
@@ -115,6 +117,10 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 		return name, nil
 	}
 
+	if isMapped(s) {
+		return ts.mappedType(s)
+	}
+
 	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 || len(s.AllOf) > 0 {
 		// TODO(phase 2): composite schemas.
 		ts.imports["encoding/json"] = true
@@ -187,6 +193,15 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 	ts.add(d)
 
 	switch {
+	case isMapped(s):
+		t, err := ts.mappedType(s)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if t == name {
+			return fmt.Errorf("%s: x-go-type %q refers to itself: the generated package declares %s, so name a type in another package", name, t, name)
+		}
+		d.Kind, d.Under = "alias", t
 	case schemaType(s) == "object" && len(s.Properties) > 0:
 		d.Kind = "struct"
 		required := map[string]bool{}
@@ -231,6 +246,73 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 	return nil
 }
 
+func isMapped(s *spec.Schema) bool {
+	return s.GoType != "" || s.GoTypeImport != ""
+}
+
+// mappedType returns the Go type named by the x-go-type extension and records
+// its import. The rest of the schema is ignored.
+func (ts *typeSet) mappedType(s *spec.Schema) (string, error) {
+	if s.GoType == "" {
+		return "", fmt.Errorf("x-go-type-import %q without x-go-type", s.GoTypeImport)
+	}
+	expr, err := parser.ParseExpr(s.GoType)
+	if err != nil {
+		return "", fmt.Errorf("x-go-type %q is not a Go type", s.GoType)
+	}
+	pkgs := map[string]bool{}
+	if !typePackages(expr, pkgs) {
+		return "", fmt.Errorf("x-go-type %q is not a Go type", s.GoType)
+	}
+	if s.GoTypeImport == "" {
+		if len(pkgs) > 0 {
+			return "", fmt.Errorf("x-go-type %q needs x-go-type-import", s.GoType)
+		}
+		return s.GoType, nil
+	}
+	if strings.ContainsAny(s.GoTypeImport, " \t\r\n\"\\`") {
+		return "", fmt.Errorf("invalid x-go-type-import %q", s.GoTypeImport)
+	}
+	if len(pkgs) != 1 {
+		return "", fmt.Errorf("x-go-type %q must name exactly one package, the one x-go-type-import %q imports", s.GoType, s.GoTypeImport)
+	}
+	ts.imports[s.GoTypeImport] = true
+	return s.GoType, nil
+}
+
+// typePackages adds the package qualifiers used in a type expression to pkgs.
+// It reports false if e is not a type expression.
+func typePackages(e ast.Expr, pkgs map[string]bool) bool {
+	switch e := e.(type) {
+	case *ast.Ident:
+		return true
+	case *ast.SelectorExpr:
+		x, ok := e.X.(*ast.Ident)
+		if ok {
+			pkgs[x.Name] = true
+		}
+		return ok
+	case *ast.StarExpr:
+		return typePackages(e.X, pkgs)
+	case *ast.ArrayType:
+		if _, sized := e.Len.(*ast.BasicLit); e.Len != nil && !sized {
+			return false
+		}
+		return typePackages(e.Elt, pkgs)
+	case *ast.MapType:
+		return typePackages(e.Key, pkgs) && typePackages(e.Value, pkgs)
+	case *ast.IndexExpr:
+		return typePackages(e.X, pkgs) && typePackages(e.Index, pkgs)
+	case *ast.IndexListExpr:
+		ok := typePackages(e.X, pkgs)
+		for _, idx := range e.Indices {
+			ok = ok && typePackages(idx, pkgs)
+		}
+		return ok
+	}
+	return false
+}
+
 func schemaType(s *spec.Schema) string {
 	if s.Type == "" && len(s.Properties) > 0 {
 		return "object"
@@ -251,6 +333,6 @@ func schemaDoc(s *spec.Schema) string {
 // needsPointer reports whether an optional field of type t should be a
 // pointer to distinguish "absent" from the zero value.
 func needsPointer(t string) bool {
-	return !strings.HasPrefix(t, "[]") && !strings.HasPrefix(t, "map[") &&
+	return !strings.HasPrefix(t, "[]") && !strings.HasPrefix(t, "map[") && !strings.HasPrefix(t, "*") &&
 		t != "any" && t != "json.RawMessage"
 }
