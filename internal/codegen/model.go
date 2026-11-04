@@ -3,6 +3,7 @@ package codegen
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -11,17 +12,35 @@ import (
 )
 
 // model is the template input: the AsyncAPI document reduced to models,
-// channel definitions and the operations of the thin generated client.
+// channel definitions and the thin generated types holding the operations.
 type model struct {
-	Package    string
-	Title      string
-	Version    string
-	ModelsOnly bool
-	Imports    []string
-	Types      []*typeDecl
-	Headers    []*headerDecl
-	Channels   []*channel
-	Ops        []*operation
+	Package  string
+	Title    string
+	Version  string
+	Imports  []string
+	Types    []*typeDecl
+	Headers  []*headerDecl
+	Channels []*channel
+	Ops      []*operation
+	APIs     []*apiType
+}
+
+// apiType is a generated type holding the operations of one Part.
+type apiType struct {
+	Name string
+	Role string // completes "<Name> <Role> <title>" in the type's doc comment
+	Ops  []*operation
+}
+
+var apiTypes = []struct {
+	part Part
+	name string
+	role string
+}{
+	{PartProducer, "Producer", "publishes the messages of"},
+	{PartConsumer, "Consumer", "subscribes to the messages of"},
+	{PartClient, "Client", "sends the requests of"},
+	{PartServer, "Server", "answers the requests of"},
 }
 
 type channel struct {
@@ -97,6 +116,56 @@ func (m *model) HasReceive() bool {
 	return false
 }
 func (o *operation) IsReceive() bool { return o.Action == spec.ActionReceive }
+
+// Part returns the part the operation is generated in.
+func (o *operation) Part() Part {
+	switch {
+	case o.IsSend() && o.Reply == nil:
+		return PartProducer
+	case o.IsSend():
+		return PartClient
+	case o.Reply == nil:
+		return PartConsumer
+	default:
+		return PartServer
+	}
+}
+
+// selectParts reduces the model to the given parts; none means all of them.
+func (m *model) selectParts(parts []Part) error {
+	if len(parts) == 0 {
+		parts = allParts
+	}
+	var ops []*operation
+	used := map[*channel]bool{}
+	for _, o := range m.Ops {
+		if slices.Contains(parts, o.Part()) {
+			ops = append(ops, o)
+			used[o.Channel] = true
+		}
+	}
+	m.Ops = ops
+	m.Channels = slices.DeleteFunc(m.Channels, func(c *channel) bool { return !used[c] })
+
+	for _, t := range apiTypes {
+		api := &apiType{Name: t.name, Role: t.role}
+		for _, o := range m.Ops {
+			if o.Part() == t.part {
+				api.Ops = append(api.Ops, o)
+			}
+		}
+		if len(api.Ops) == 0 {
+			continue
+		}
+		for _, d := range m.Types {
+			if d.Name == t.name || d.Name == "New"+t.name {
+				return fmt.Errorf("type %s generated from the document clashes with the generated %s", d.Name, t.name)
+			}
+		}
+		m.APIs = append(m.APIs, api)
+	}
+	return nil
+}
 
 var paramRe = regexp.MustCompile(`\{([^{}]+)\}`)
 

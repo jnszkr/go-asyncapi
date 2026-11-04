@@ -11,7 +11,7 @@
 //		AckPolicy:     jetstream.AckExplicitPolicy,
 //		AckWait:       30 * time.Second,
 //	})
-//	c := orders.NewClient(jsbroker.New(js))
+//	c := orders.NewConsumer(jsbroker.New(js))
 //	c.OnOrderCreated(handle, jsbroker.From(cons, jetstream.PullMaxMessages(10)))
 //
 // Messages are acked when the handler returns nil, nakked (redelivered) when

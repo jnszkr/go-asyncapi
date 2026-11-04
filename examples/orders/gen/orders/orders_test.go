@@ -30,7 +30,9 @@ func connect(t *testing.T) *nats.Conn {
 func TestPublishSubscribe(t *testing.T) {
 	nc := connect(t)
 	errs := make(chan error, 1)
-	c := orders.NewClient(natsbroker.New(nc), broker.WithErrorHandler(func(err error) { errs <- err }))
+	b := natsbroker.New(nc)
+	c := orders.NewConsumer(b, broker.WithErrorHandler(func(err error) { errs <- err }))
+	p := orders.NewProducer(b)
 
 	got := make(chan broker.Received[orders.Order], 1)
 	sub, err := c.OnOrderCreated(func(_ context.Context, m broker.Received[orders.Order]) error {
@@ -53,7 +55,7 @@ func TestPublishSubscribe(t *testing.T) {
 		Status: orders.OrderStatusPending,
 		Items:  []orders.LineItem{{SKU: "sku-1", Quantity: 3}},
 	}
-	err = c.PublishOrderCreated(context.Background(), orders.OrderCreatedParams("eu"), order,
+	err = p.PublishOrderCreated(context.Background(), orders.OrderCreatedParams("eu"), order,
 		broker.WithHeader(orders.OrderCreatedHeaderTraceID, "trace-1"))
 	if err != nil {
 		t.Fatal(err)
@@ -78,18 +80,20 @@ func TestPublishSubscribe(t *testing.T) {
 }
 
 func TestPublishRejectsInvalidParams(t *testing.T) {
-	c := orders.NewClient(natsbroker.New(connect(t)))
+	p := orders.NewProducer(natsbroker.New(connect(t)))
 	for _, region := range []string{"", "apac", "eu.x", "*"} {
-		if err := c.PublishOrderCreated(context.Background(), orders.OrderCreatedParams(region), orders.Order{}); err == nil {
+		if err := p.PublishOrderCreated(context.Background(), orders.OrderCreatedParams(region), orders.Order{}); err == nil {
 			t.Errorf("region %q: expected error", region)
 		}
 	}
 }
 
 func TestRequestReply(t *testing.T) {
-	c := orders.NewClient(natsbroker.New(connect(t)))
+	b := natsbroker.New(connect(t))
+	c := orders.NewClient(b)
+	s := orders.NewServer(b)
 
-	sub, err := c.ServeOrderStatus(func(_ context.Context, m broker.Received[orders.StatusRequest]) (orders.StatusReply, error) {
+	sub, err := s.ServeOrderStatus(func(_ context.Context, m broker.Received[orders.StatusRequest]) (orders.StatusReply, error) {
 		if m.Payload.OrderID == "missing" {
 			return orders.StatusReply{}, errors.New("order not found")
 		}
@@ -121,7 +125,7 @@ func TestRequestReply(t *testing.T) {
 // TestGenericCallsWork shows the generated channels used directly with the
 // generic functions, without the typed wrappers.
 func TestGenericCallsWork(t *testing.T) {
-	c := orders.NewClient(natsbroker.New(connect(t)))
+	c := orders.NewProducer(natsbroker.New(connect(t)))
 	got := make(chan string, 1)
 	_, err := broker.Subscribe(c.Client, orders.OrderCreatedChannel, func(_ context.Context, m broker.Received[orders.Order]) error {
 		got <- m.Payload.ID
@@ -146,7 +150,7 @@ func TestGenericCallsWork(t *testing.T) {
 	}
 }
 
-// TestJetStream runs the same generated client on JetStream. The stream and
+// TestJetStream runs the same generated code on JetStream. The stream and
 // consumer are the application's, configured here in full and passed to the
 // receive operation with jsbroker.From.
 func TestJetStream(t *testing.T) {
@@ -180,10 +184,12 @@ func TestJetStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := orders.NewClient(jsbroker.New(js))
+	b := jsbroker.New(js)
+	p := orders.NewProducer(b)
+	c := orders.NewConsumer(b)
 
 	// Published before anyone subscribes: the stream keeps it.
-	if err := c.PublishOrderCreated(ctx, orders.OrderCreatedParams("us"), orders.Order{ID: "o-3"}); err != nil {
+	if err := p.PublishOrderCreated(ctx, orders.OrderCreatedParams("us"), orders.Order{ID: "o-3"}); err != nil {
 		t.Fatal(err)
 	}
 
