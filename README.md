@@ -109,13 +109,13 @@ See [examples/orders](examples/orders) for the full spec and generated code.
 
 ### JetStream
 
-The same generated code runs on JetStream through `jsbroker`. Streams and consumers
-are not created or configured for you: retention, replicas, ack wait, delivery policy,
-filters and the rest are the application's. Create the consumer with the `jetstream`
-package and pass it to the receive operation with `jsbroker.From`, together with any
-`jetstream.PullConsumeOpt`s for `Consume`. The generated `XxxEndpoint`
-(`broker.Endpoint{Subject, Queue}`) is there if you want the operation's subject and
-queue name in the config:
+The same generated code runs on JetStream through `jsbroker`, which has no configuration
+of its own. Streams and consumers are not created or configured for you: retention,
+replicas, ack wait, delivery policy, filters, consume options and the rest are the
+application's. Create the consumer with the `jetstream` package and pass it to the receive
+operation with `jsbroker.From`, together with any `jetstream.PullConsumeOpt`s for `Consume`.
+The generated `XxxEndpoint` (`broker.Endpoint{Subject, Queue}`) is there if you want the
+operation's subject and queue name in the config:
 
 ```go
 js, _ := jetstream.New(nc)
@@ -131,9 +131,54 @@ orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.From(cons, jetstream.PullM
 orders.NewProducer(b).PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), order) // waits for the stream's ack
 ```
 
-A handler returning `nil` acks the message, an error naks it (redelivery), and a
-message that cannot be decoded is terminated. Subscribing without `jsbroker.From` fails
-with `jsbroker.ErrNoConsumer`, and a consumer whose filter reaches outside the
+To create the consumer when subscribing, implement `jsbroker.ConsumerFactory` or use
+`jsbroker.ConsumerFunc`, and pass it with `jsbroker.FromFactory`. The factory gets the
+subscription's subject and queue name, and returns the consumer with its consume options:
+
+```go
+consumers := jsbroker.ConsumerFunc(func(cfg broker.SubConfig) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
+	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:       cfg.Queue,
+		FilterSubject: cfg.Subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	return cons, []jetstream.PullConsumeOpt{jetstream.PullMaxMessages(10)}, err
+})
+orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.FromFactory(consumers))
+```
+
+`FromFactory` also takes interceptors specific to JetStream, which wrap the delivery of each
+message and see the `jetstream.Msg` and the handler's error (see also
+[Interceptors](#interceptors)). Returning a different error changes what happens to
+the message, and calling `msg.NakWithDelay`, `msg.Term` or the like settles it directly. This
+one moves a message to a dead letter queue once it has failed five times, or at once if it
+cannot be decoded. Use `jsbroker.Existing` to intercept a consumer you already have:
+
+```go
+deadLetter := func(next jsbroker.Deliver) jsbroker.Deliver {
+	return func(ctx context.Context, msg jetstream.Msg) error {
+		err := next(ctx, msg)
+		if err == nil {
+			return nil
+		}
+		md, merr := msg.Metadata()
+		if merr != nil {
+			return merr
+		}
+		if md.NumDelivered < 5 && !errors.Is(err, broker.ErrMalformed) {
+			return err // nak: try again
+		}
+		_, perr := js.Publish(ctx, "dlq."+msg.Subject(), msg.Data())
+		return perr // nil acks it, now that it is stored elsewhere
+	}
+}
+orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.FromFactory(jsbroker.Existing(cons), deadLetter))
+```
+
+Without interceptors, a handler returning `nil` acks the message, an error naks it
+(redelivery), and a message that cannot be decoded is terminated. A failed ack is not
+reported: the server redelivers the message after its ack wait. Subscribing without
+`jsbroker.From` or `jsbroker.FromFactory` fails with `jsbroker.ErrNoConsumer`, and a consumer whose filter reaches outside the
 operation's subject is rejected rather than having those messages terminated. Other
 brokers reject `jsbroker.From`.
 Request/reply is not stored: `Request` goes over core NATS, and a `Server` should run on
@@ -198,6 +243,43 @@ validator next to a `Producer` without one checks incoming messages alone. A `Cl
 Responder errors are sent back using the `Nats-Service-Error` / `Nats-Service-Error-Code`
 headers and surface as `*broker.RemoteError` on the requesting side. Use
 `broker.WithErrorCodec` to change that (see below).
+
+### Interceptors
+
+Interceptors wrap what a generated type sends and receives, on every transport and without
+writing a transport of your own. Pass them as options to the generated constructors, the
+first being the outermost:
+
+| Option | Wraps | For example |
+|---|---|---|
+| `broker.WithPublishInterceptors` | publishing, including the replies of a `Server` | adding headers |
+| `broker.WithRequestInterceptors` | sending a request and waiting for its reply | authentication, retries |
+| `broker.WithReceiveInterceptors` | decoding and handling a received message, including requests | tracing, dead letter queues |
+
+```go
+deadLetter := func(next broker.ReceiveFunc) broker.ReceiveFunc {
+	return func(ctx context.Context, m *broker.Message) error {
+		err := next(ctx, m)
+		if err == nil {
+			return nil
+		}
+		return nc.PublishMsg(&nats.Msg{Subject: "dead." + m.Subject, Header: nats.Header(m.Header), Data: m.Data})
+	}
+}
+consumer := orders.NewConsumer(natsbroker.New(nc), broker.WithReceiveInterceptors(deadLetter))
+
+authenticate := func(next broker.RequestFunc) broker.RequestFunc {
+	return func(ctx context.Context, m *broker.Message) (*broker.Message, error) {
+		m.Header.Set("Authorization", token(ctx))
+		return next(ctx, m)
+	}
+}
+client := orders.NewClient(natsbroker.New(nc), broker.WithRequestInterceptors(authenticate))
+```
+
+Core NATS has no redelivery, so the error a receive interceptor returns goes nowhere there.
+On JetStream it decides what happens to the message, as described above. A `Server` sends
+handler errors to the requester, so its receive interceptors see `nil` for those.
 
 ### Bringing your own transport
 
