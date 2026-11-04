@@ -405,8 +405,9 @@ Other validation keywords, such as `minimum` or `pattern`, are likewise only enf
 
 ## Status
 
-Early MVP. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and current limitations
-(one message type per channel, untyped `oneOf`/`anyOf`, local `$ref`s only).
+Pre-1.0: usable and tested, but the API may still change between minor versions. The main
+limitations are one message type per channel, untyped `oneOf`/`anyOf` and local `$ref`s only.
+See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Development
 
