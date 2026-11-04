@@ -35,12 +35,13 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 }
 
 // Subscribe uses a core NATS subscription, which has no acknowledgements:
-// the error returned by h is ignored. It supports no SubConfig.Source.
-func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) (broker.Subscription, error) {
+// the error returned by h is ignored. It supports no SubConfig.Source. h gets
+// a background context; wrap the Broker to derive one from the message.
+func (b *Broker) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
 	if cfg.Source != nil {
 		return nil, fmt.Errorf("natsbroker: unsupported source %T", cfg.Source)
 	}
-	cb := func(m *nats.Msg) { _ = h(fromNATS(m)) }
+	cb := func(m *nats.Msg) { _ = h(context.Background(), fromNATS(m)) }
 	if cfg.Queue != "" {
 		return b.nc.QueueSubscribe(cfg.Subject, cfg.Queue, cb)
 	}

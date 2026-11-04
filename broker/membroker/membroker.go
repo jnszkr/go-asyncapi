@@ -29,7 +29,7 @@ type sub struct {
 	b       *Broker
 	pattern string
 	queue   string
-	h       func(*broker.Message) error
+	h       func(context.Context, *broker.Message) error
 }
 
 func (s *sub) Unsubscribe() error {
@@ -48,8 +48,9 @@ func (s *sub) Unsubscribe() error {
 func New() *Broker { return &Broker{next: map[string]int{}} }
 
 // Subscribe registers h. The error h returns is ignored; there is no
-// redelivery. It supports no SubConfig.Source.
-func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) (broker.Subscription, error) {
+// redelivery. It supports no SubConfig.Source. As on a real transport, only
+// the message reaches h: its context is a background one, not the sender's.
+func (b *Broker) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
 	if cfg.Source != nil {
 		return nil, fmt.Errorf("membroker: unsupported source %T", cfg.Source)
 	}
@@ -62,7 +63,7 @@ func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) 
 
 func (b *Broker) Publish(_ context.Context, m *broker.Message) error {
 	for _, s := range b.targets(m.Subject) {
-		_ = s.h(clone(m))
+		_ = s.h(context.Background(), clone(m))
 	}
 	return nil
 }
@@ -74,7 +75,7 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 	b.mu.Unlock()
 
 	replies := make(chan *broker.Message, 1)
-	s, _ := b.Subscribe(broker.SubConfig{Subject: inbox}, func(r *broker.Message) error {
+	s, _ := b.Subscribe(broker.SubConfig{Subject: inbox}, func(_ context.Context, r *broker.Message) error {
 		select {
 		case replies <- r:
 		default:

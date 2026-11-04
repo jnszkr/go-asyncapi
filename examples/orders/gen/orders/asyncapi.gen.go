@@ -101,9 +101,10 @@ type Producer struct {
 	*broker.Client
 }
 
-// NewProducer returns a Producer on top of b, e.g. natsbroker.New(nc).
-func NewProducer(b broker.Broker, opts ...broker.Option) *Producer {
-	return &Producer{Client: broker.New(b, opts...)}
+// NewProducer returns a Producer on top of b, e.g. natsbroker.New(nc) or an
+// application's own broker.Publisher.
+func NewProducer(b broker.Publisher, opts ...broker.Option) *Producer {
+	return &Producer{Client: broker.ForPublisher(b, opts...)}
 }
 
 // Operation "publishOrderCreated": send on orders.{region}.created.
@@ -118,9 +119,10 @@ type Consumer struct {
 	*broker.Client
 }
 
-// NewConsumer returns a Consumer on top of b, e.g. natsbroker.New(nc).
-func NewConsumer(b broker.Broker, opts ...broker.Option) *Consumer {
-	return &Consumer{Client: broker.New(b, opts...)}
+// NewConsumer returns a Consumer on top of b, e.g. natsbroker.New(nc) or an
+// application's own broker.Subscriber.
+func NewConsumer(b broker.Subscriber, opts ...broker.Option) *Consumer {
+	return &Consumer{Client: broker.ForSubscriber(b, opts...)}
 }
 
 // Process new orders; instances share the work through a queue group.
@@ -137,9 +139,10 @@ type Client struct {
 	*broker.Client
 }
 
-// NewClient returns a Client on top of b, e.g. natsbroker.New(nc).
-func NewClient(b broker.Broker, opts ...broker.Option) *Client {
-	return &Client{Client: broker.New(b, opts...)}
+// NewClient returns a Client on top of b, e.g. natsbroker.New(nc) or an
+// application's own broker.Requester.
+func NewClient(b broker.Requester, opts ...broker.Option) *Client {
+	return &Client{Client: broker.ForRequester(b, opts...)}
 }
 
 // Operation "getOrderStatus": send on orders.status.get.
@@ -154,9 +157,10 @@ type Server struct {
 	*broker.Client
 }
 
-// NewServer returns a Server on top of b, e.g. natsbroker.New(nc).
-func NewServer(b broker.Broker, opts ...broker.Option) *Server {
-	return &Server{Client: broker.New(b, opts...)}
+// NewServer returns a Server on top of b, e.g. natsbroker.New(nc) or an
+// application's own broker.PubSub.
+func NewServer(b broker.PubSub, opts ...broker.Option) *Server {
+	return &Server{Client: broker.ForPubSub(b, opts...)}
 }
 
 // Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").

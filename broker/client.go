@@ -26,6 +26,35 @@ func (JSON) ContentType() string                { return "application/json" }
 func (JSON) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
 func (JSON) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
+// ErrorCodec maps errors to and from reply messages, for applications whose
+// requesters and responders follow their own convention.
+type ErrorCodec interface {
+	// EncodeError writes err onto a reply, which has an empty Header and no
+	// Data yet. code is "400" when the request itself was rejected, and "500"
+	// for any other failure to answer it.
+	EncodeError(reply *Message, code string, err error)
+	// DecodeError returns the error carried by a reply, or nil if it holds
+	// a regular response. Request returns that error to its caller as is.
+	DecodeError(reply *Message) error
+}
+
+// ServiceErrors is the default ErrorCodec. It uses the headers of the NATS
+// micro protocol, HeaderServiceError and HeaderServiceErrorCode, and decodes
+// to *RemoteError.
+type ServiceErrors struct{}
+
+func (ServiceErrors) EncodeError(reply *Message, code string, err error) {
+	reply.Header.Set(HeaderServiceError, err.Error())
+	reply.Header.Set(HeaderServiceErrorCode, code)
+}
+
+func (ServiceErrors) DecodeError(reply *Message) error {
+	if desc := reply.Header.Get(HeaderServiceError); desc != "" {
+		return &RemoteError{Code: reply.Header.Get(HeaderServiceErrorCode), Description: desc}
+	}
+	return nil
+}
+
 // Validator checks payloads against JSON Schemas. See schemavalidate for an
 // implementation.
 type Validator interface {
@@ -35,11 +64,15 @@ type Validator interface {
 	Compile(schema string) (func(data []byte) error, error)
 }
 
-// Client pairs a Broker with a codec and error handling. It is the first
+// Client pairs a transport with a codec and error handling. It is the first
 // argument of the generic functions in this package.
 type Client struct {
-	broker         Broker
+	transport      any
+	pub            Publisher
+	req            Requester
+	sub            Subscriber
 	codec          Codec
+	errors         ErrorCodec
 	onError        func(error)
 	requestTimeout time.Duration
 	validator      Validator
@@ -55,6 +88,10 @@ func WithCodec(codec Codec) Option { return func(c *Client) { c.codec = codec } 
 // WithErrorHandler receives errors from handling received messages
 // (decoding failures, handler errors). By default they are discarded.
 func WithErrorHandler(fn func(error)) Option { return func(c *Client) { c.onError = fn } }
+
+// WithErrorCodec replaces how errors travel in replies. The default is
+// ServiceErrors.
+func WithErrorCodec(codec ErrorCodec) Option { return func(c *Client) { c.errors = codec } }
 
 // WithRequestTimeout applies to requests whose context has no deadline.
 // The default is 5 seconds.
@@ -73,16 +110,42 @@ func WithRequestTimeout(d time.Duration) Option { return func(c *Client) { c.req
 func WithValidator(v Validator) Option { return func(c *Client) { c.validator = v } }
 
 // New returns a Client on top of b.
-func New(b Broker, opts ...Option) *Client {
-	c := &Client{broker: b, codec: JSON{}, onError: func(error) {}, requestTimeout: 5 * time.Second}
+func New(b Broker, opts ...Option) *Client { return newClient(b, opts) }
+
+// ForPublisher returns a Client on top of a transport that publishes. See
+// ErrUnsupported for the operations it lacks.
+func ForPublisher(p Publisher, opts ...Option) *Client { return newClient(p, opts) }
+
+// ForRequester returns a Client on top of a transport that sends requests.
+// See ErrUnsupported for the operations it lacks.
+func ForRequester(r Requester, opts ...Option) *Client { return newClient(r, opts) }
+
+// ForSubscriber returns a Client on top of a transport that subscribes. See
+// ErrUnsupported for the operations it lacks.
+func ForSubscriber(s Subscriber, opts ...Option) *Client { return newClient(s, opts) }
+
+// ForPubSub returns a Client on top of a transport that subscribes and
+// publishes, as answering requests takes. See ErrUnsupported for the
+// operations it lacks.
+func ForPubSub(ps PubSub, opts ...Option) *Client { return newClient(ps, opts) }
+
+func newClient(transport any, opts []Option) *Client {
+	c := &Client{transport: transport, codec: JSON{}, errors: ServiceErrors{}, onError: func(error) {}, requestTimeout: 5 * time.Second}
+	c.pub, _ = transport.(Publisher)
+	c.req, _ = transport.(Requester)
+	c.sub, _ = transport.(Subscriber)
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
 }
 
-// Broker returns the underlying transport.
-func (c *Client) Broker() Broker { return c.broker }
+// Broker returns the transport the Client was created with.
+func (c *Client) Broker() any { return c.transport }
+
+func (c *Client) unsupported(op string) error {
+	return fmt.Errorf("%w: %T cannot %s", ErrUnsupported, c.transport, op)
+}
 
 const (
 	HeaderContentType      = "Content-Type"
@@ -95,11 +158,16 @@ const (
 // channel. Brokers with redelivery drop these instead of retrying them.
 var ErrMalformed = errors.New("malformed message")
 
+// ErrUnsupported is returned by the generic functions when the Client's
+// transport lacks the operation they need.
+var ErrUnsupported = errors.New("operation not supported by transport")
+
 // ErrInvalidPayload wraps errors about payloads that do not conform to their
 // schema. See WithValidator.
 var ErrInvalidPayload = errors.New("invalid payload")
 
-// RemoteError is returned by Request when the responder reported an error.
+// RemoteError is returned by Request when the responder reported an error
+// and the Client uses ServiceErrors.
 type RemoteError struct {
 	Code        string
 	Description string
@@ -141,6 +209,9 @@ func WithSource(src any) SubOption { return func(s *SubConfig) { s.Source = src 
 
 // Publish sends msg on ch.
 func Publish[T any](ctx context.Context, c *Client, ch Channel[T], p Params, msg T, opts ...MsgOption) error {
+	if c.pub == nil {
+		return c.unsupported("publish")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -148,12 +219,15 @@ func Publish[T any](ctx context.Context, c *Client, ch Channel[T], p Params, msg
 	if err != nil {
 		return err
 	}
-	return c.broker.Publish(ctx, m)
+	return c.pub.Publish(ctx, m)
 }
 
 // Request sends req on ch and decodes the reply.
 func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p Params, req Req, opts ...MsgOption) (Resp, error) {
 	var resp Resp
+	if c.req == nil {
+		return resp, c.unsupported("request")
+	}
 	m, err := c.encode(ch, ch.Schema, p, req, opts)
 	if err != nil {
 		return resp, err
@@ -163,12 +237,12 @@ func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p P
 		ctx, cancel = context.WithTimeout(ctx, c.requestTimeout)
 		defer cancel()
 	}
-	rm, err := c.broker.Request(ctx, m)
+	rm, err := c.req.Request(ctx, m)
 	if err != nil {
 		return resp, fmt.Errorf("request %s: %w", m.Subject, err)
 	}
-	if desc := rm.Header.Get(HeaderServiceError); desc != "" {
-		return resp, &RemoteError{Code: rm.Header.Get(HeaderServiceErrorCode), Description: desc}
+	if err := c.errors.DecodeError(rm); err != nil {
+		return resp, err
 	}
 	if err := c.validateReceived(ch.ReplySchema, rm.Data); err != nil {
 		return resp, fmt.Errorf("reply from %s: %w", m.Subject, err)
@@ -179,15 +253,16 @@ func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p P
 	return resp, nil
 }
 
-// Subscribe calls h for every message on ch, across all parameter values.
+// Subscribe calls h for every message on ch, across all parameter values,
+// with the context the transport provides for the message.
 func Subscribe[T any](c *Client, ch Channel[T], h Handler[T], opts ...SubOption) (Subscription, error) {
 	if _, err := c.checker(ch.Schema); err != nil {
 		return nil, err
 	}
-	return c.subscribe(ch.Pattern(), opts, func(m *Message) error {
+	return c.subscribe(ch.Pattern(), opts, func(ctx context.Context, m *Message) error {
 		r, err := decode(c, ch, m)
 		if err == nil {
-			err = h(context.Background(), r)
+			err = h(ctx, r)
 		}
 		if err != nil {
 			err = fmt.Errorf("%s: %w", m.Subject, err)
@@ -197,15 +272,21 @@ func Subscribe[T any](c *Client, ch Channel[T], h Handler[T], opts ...SubOption)
 	})
 }
 
-// Respond answers requests on ch with the value returned by h. Errors are
-// sent back to the requester, which receives them as *RemoteError.
+// Respond answers requests on ch with the value returned by h, called with
+// the context the transport provides for the request. Replies are published
+// with that context's values, but not its deadline: a handler that ran out of
+// time can still report it. Errors are sent back to the requester using the
+// Client's ErrorCodec, by default as *RemoteError.
 func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], opts ...SubOption) (Subscription, error) {
+	if c.pub == nil {
+		return nil, c.unsupported("publish replies")
+	}
 	for _, schema := range []string{ch.Schema, ch.ReplySchema} {
 		if _, err := c.checker(schema); err != nil {
 			return nil, err
 		}
 	}
-	return c.subscribe(ch.Pattern(), opts, func(m *Message) error {
+	return c.subscribe(ch.Pattern(), opts, func(ctx context.Context, m *Message) error {
 		if m.Reply == "" {
 			err := fmt.Errorf("%s: %w: request without reply subject", m.Subject, ErrMalformed)
 			c.onError(err)
@@ -213,27 +294,22 @@ func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], 
 		}
 		r, err := decode(c, ch, m)
 		if err != nil {
-			return c.respondError(m, "400", err)
+			return c.respondError(ctx, m, "400", err)
 		}
-		resp, err := h(context.Background(), r)
+		resp, err := h(ctx, r)
 		if err != nil {
-			return c.respondError(m, "500", err)
+			return c.respondError(ctx, m, "500", err)
 		}
 		data, err := c.codec.Marshal(resp)
 		if err != nil {
-			return c.respondError(m, "500", err)
+			return c.respondError(ctx, m, "500", err)
 		}
 		if err := c.validate(ch.ReplySchema, data); err != nil {
-			return c.respondError(m, "500", err)
+			return c.respondError(ctx, m, "500", err)
 		}
 		reply := &Message{Subject: m.Reply, Header: Header{}, Data: data}
 		reply.Header.Set(HeaderContentType, c.codec.ContentType())
-		if err := c.broker.Publish(context.Background(), reply); err != nil {
-			err = fmt.Errorf("%s: respond: %w", m.Subject, err)
-			c.onError(err)
-			return err
-		}
-		return nil
+		return c.reply(ctx, m, reply)
 	})
 }
 
@@ -330,25 +406,32 @@ func isJSON(contentType string) bool {
 	return media == "application/json" || strings.HasSuffix(media, "+json")
 }
 
-func (c *Client) subscribe(subject string, opts []SubOption, h func(*Message) error) (Subscription, error) {
+func (c *Client) subscribe(subject string, opts []SubOption, h func(context.Context, *Message) error) (Subscription, error) {
+	if c.sub == nil {
+		return nil, c.unsupported("subscribe")
+	}
 	var cfg SubConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 	cfg.Subject = subject
-	return c.broker.Subscribe(cfg, h)
+	return c.sub.Subscribe(cfg, h)
 }
 
 // respondError sends err back to the requester. The request counts as
 // handled once the error reply is sent.
-func (c *Client) respondError(m *Message, code string, err error) error {
+func (c *Client) respondError(ctx context.Context, m *Message, code string, err error) error {
 	reply := &Message{Subject: m.Reply, Header: Header{}}
-	reply.Header.Set(HeaderServiceError, err.Error())
-	reply.Header.Set(HeaderServiceErrorCode, code)
-	if perr := c.broker.Publish(context.Background(), reply); perr != nil {
-		perr = fmt.Errorf("%s: respond: %w", m.Subject, perr)
-		c.onError(perr)
-		return perr
+	c.errors.EncodeError(reply, code, err)
+	return c.reply(ctx, m, reply)
+}
+
+// reply publishes the reply to request m.
+func (c *Client) reply(ctx context.Context, m, reply *Message) error {
+	if err := c.pub.Publish(context.WithoutCancel(ctx), reply); err != nil {
+		err = fmt.Errorf("%s: respond: %w", m.Subject, err)
+		c.onError(err)
+		return err
 	}
 	return nil
 }

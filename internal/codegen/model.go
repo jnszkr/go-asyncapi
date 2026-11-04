@@ -31,18 +31,22 @@ type model struct {
 type apiType struct {
 	Name string
 	Role string // completes "<Name> <Role> <title>" in the type's doc comment
-	Ops  []*operation
+	// Transport is the part of the broker package's Broker the type needs,
+	// which broker.For<Transport> accepts.
+	Transport string
+	Ops       []*operation
 }
 
 var apiTypes = []struct {
-	part Part
-	name string
-	role string
+	part      Part
+	name      string
+	role      string
+	transport string
 }{
-	{PartProducer, "Producer", "publishes the messages of"},
-	{PartConsumer, "Consumer", "subscribes to the messages of"},
-	{PartClient, "Client", "sends the requests of"},
-	{PartServer, "Server", "answers the requests of"},
+	{PartProducer, "Producer", "publishes the messages of", "Publisher"},
+	{PartConsumer, "Consumer", "subscribes to the messages of", "Subscriber"},
+	{PartClient, "Client", "sends the requests of", "Requester"},
+	{PartServer, "Server", "answers the requests of", "PubSub"},
 }
 
 type channel struct {
@@ -162,7 +166,7 @@ func (m *model) selectParts(parts []Part) error {
 	m.declareSchemas()
 
 	for _, t := range apiTypes {
-		api := &apiType{Name: t.name, Role: t.role}
+		api := &apiType{Name: t.name, Role: t.role, Transport: t.transport}
 		for _, o := range m.Ops {
 			if o.Part() == t.part {
 				api.Ops = append(api.Ops, o)

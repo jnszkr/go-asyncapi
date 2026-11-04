@@ -92,8 +92,9 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 // ErrNoConsumer is returned by Subscribe when no consumer was given with From.
 var ErrNoConsumer = errors.New("jsbroker: no consumer (use jsbroker.From)")
 
-// Subscribe consumes from the consumer set with From.
-func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) (broker.Subscription, error) {
+// Subscribe consumes from the consumer set with From. h gets a background
+// context; wrap the Broker to derive one from the message.
+func (b *Broker) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
 	src, ok := cfg.Source.(source)
 	switch {
 	case cfg.Source == nil:
@@ -110,7 +111,7 @@ func (b *Broker) Subscribe(cfg broker.SubConfig, h func(*broker.Message) error) 
 		}),
 	}, src.opts...)
 	cc, err := src.consumer.Consume(func(msg jetstream.Msg) {
-		herr := h(&broker.Message{Subject: msg.Subject(), Header: broker.Header(msg.Headers()), Data: msg.Data()})
+		herr := h(context.Background(), &broker.Message{Subject: msg.Subject(), Header: broker.Header(msg.Headers()), Data: msg.Data()})
 		var aerr error
 		switch {
 		case herr == nil:

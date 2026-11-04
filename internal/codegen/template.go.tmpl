@@ -90,9 +90,10 @@ type {{.Name}} struct {
 	*broker.Client
 }
 
-// New{{.Name}} returns a {{.Name}} on top of b, e.g. natsbroker.New(nc).
-func New{{.Name}}(b broker.Broker, opts ...broker.Option) *{{.Name}} {
-	return &{{.Name}}{Client: broker.New(b, opts...)}
+// New{{.Name}} returns a {{.Name}} on top of b, e.g. natsbroker.New(nc) or an
+// application's own broker.{{.Transport}}.
+func New{{.Name}}(b broker.{{.Transport}}, opts ...broker.Option) *{{.Name}} {
+	return &{{.Name}}{Client: broker.For{{.Transport}}(b, opts...)}
 }
 {{range .Ops}}
 {{template "opdoc" .}}
