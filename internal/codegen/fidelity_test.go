@@ -292,10 +292,10 @@ func TestConstIsTypedAndDocumented(t *testing.T) {
 
 func TestIgnoredKeywordsWarn(t *testing.T) {
 	tests := map[string]struct{ payload, want string }{
-		"not":                  {`{type: object, properties: {k: {not: {type: integer}}}}`, "not"},
-		"if":                   {`{type: object, properties: {k: {if: {type: integer}}}}`, "if"},
-		"root":                 {`{type: object, not: {required: [a]}, properties: {a: {type: string}}}`, "not"},
-		"additionalProperties": {`{type: object, properties: {a: {type: string}}, additionalProperties: {type: integer}}`, "additionalProperties"},
+		"not":                  {`{type: object, properties: {k: {not: {type: integer}}}}`, "not is only enforced with broker.WithValidator"},
+		"if":                   {`{type: object, properties: {k: {if: {type: integer}}}}`, "if is only enforced with broker.WithValidator"},
+		"root":                 {`{type: object, not: {required: [a]}, properties: {a: {type: string}}}`, "not is only enforced with broker.WithValidator"},
+		"additionalProperties": {`{type: object, properties: {a: {type: string}}, additionalProperties: {type: integer}}`, "additionalProperties next to properties is only enforced"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

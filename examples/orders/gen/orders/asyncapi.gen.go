@@ -55,6 +55,13 @@ const (
 	OrderCreatedHeaderTraceID = "traceId"
 )
 
+// JSON Schemas of the payloads, checked with broker.WithValidator.
+const (
+	schemaOrderCreated  = `{"$ref":"#/definitions/Order","definitions":{"LineItem":{"properties":{"quantity":{"format":"int32","type":"integer"},"sku":{"type":"string"}},"required":["sku","quantity"],"type":"object"},"Order":{"properties":{"customerEmail":{"type":"string"},"id":{"type":"string"},"items":{"items":{"$ref":"#/definitions/LineItem"},"type":"array"},"metadata":{"additionalProperties":{"type":"string"},"type":"object"},"status":{"$ref":"#/definitions/OrderStatus"},"total":{"type":"number"}},"required":["id","items","status"],"type":"object"},"OrderStatus":{"enum":["pending","paid","shipped","cancelled"],"type":"string"}}}`
+	schemaStatusReply   = `{"definitions":{"OrderStatus":{"enum":["pending","paid","shipped","cancelled"],"type":"string"}},"properties":{"orderId":{"type":"string"},"status":{"$ref":"#/definitions/OrderStatus"},"updatedAt":{"format":"date-time","type":"string"}},"required":["orderId","status"],"type":"object"}`
+	schemaStatusRequest = `{"properties":{"orderId":{"type":"string"}},"required":["orderId"],"type":"object"}`
+)
+
 // Channels.
 var (
 	// OrderCreatedChannel is the "orderCreated" channel.
@@ -64,10 +71,12 @@ var (
 		Allowed: map[string][]string{
 			"region": {"eu", "us"},
 		},
+		Schema: schemaOrderCreated,
 	}
 	// OrderStatusChannel is the "orderStatus" channel.
 	OrderStatusChannel = broker.Channel[StatusRequest]{
 		Address: "orders.status.get",
+		Schema:  schemaStatusRequest,
 	}
 )
 
@@ -135,7 +144,7 @@ func NewClient(b broker.Broker, opts ...broker.Option) *Client {
 
 // Operation "getOrderStatus": send on orders.status.get.
 func (c *Client) GetOrderStatus(ctx context.Context, req StatusRequest, opts ...broker.MsgOption) (StatusReply, error) {
-	return broker.Request[StatusRequest, StatusReply](ctx, c.Client, OrderStatusChannel, nil, req, opts...)
+	return broker.Request[StatusRequest, StatusReply](ctx, c.Client, OrderStatusChannel.WithReplySchema(schemaStatusReply), nil, req, opts...)
 }
 
 // Server answers the requests of Order Service. Each method is a
@@ -152,5 +161,5 @@ func NewServer(b broker.Broker, opts ...broker.Option) *Server {
 
 // Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").
 func (c *Server) ServeOrderStatus(h broker.Responder[StatusRequest, StatusReply], opts ...broker.SubOption) (broker.Subscription, error) {
-	return broker.Respond(c.Client, OrderStatusChannel, h, append([]broker.SubOption{broker.Queue("order-status")}, opts...)...)
+	return broker.Respond(c.Client, OrderStatusChannel.WithReplySchema(schemaStatusReply), h, append([]broker.SubOption{broker.Queue("order-status")}, opts...)...)
 }

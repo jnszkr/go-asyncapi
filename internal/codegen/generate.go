@@ -12,6 +12,7 @@ import (
 	"go/token"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -89,6 +90,12 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 
 	tmpl, err := template.New("gen").Funcs(template.FuncMap{
 		"lines": func(s string) []string { return strings.Split(strings.TrimSpace(s), "\n") },
+		"literal": func(s string) string {
+			if strconv.CanBackquote(s) {
+				return "`" + s + "`"
+			}
+			return strconv.Quote(s)
+		},
 	}).Parse(tmplSrc)
 	if err != nil {
 		return nil, err

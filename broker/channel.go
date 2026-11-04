@@ -18,6 +18,20 @@ type Channel[T any] struct {
 	Allowed map[string][]string
 	// Defaults are used for parameters without a value.
 	Defaults map[string]string
+	// Schema is the JSON Schema of the payload, as a self-contained document.
+	// A Client with a Validator checks payloads against it; empty means no
+	// check.
+	Schema string
+	// ReplySchema is Schema for the replies of Request and Respond.
+	ReplySchema string
+}
+
+// WithReplySchema returns a copy of c with ReplySchema set. Generated code
+// calls it per operation, since operations on one channel can differ in their
+// reply.
+func (c Channel[T]) WithReplySchema(schema string) Channel[T] {
+	c.ReplySchema = schema
+	return c
 }
 
 // Subject returns the concrete subject for p.

@@ -9,6 +9,7 @@ import (
 	"github.com/jnszkr/go-asyncapi/broker"
 	"github.com/jnszkr/go-asyncapi/broker/jsbroker"
 	"github.com/jnszkr/go-asyncapi/broker/natsbroker"
+	"github.com/jnszkr/go-asyncapi/broker/schemavalidate"
 	"github.com/jnszkr/go-asyncapi/examples/orders/gen/orders"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
@@ -210,5 +211,60 @@ func TestJetStream(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for stored message")
+	}
+}
+
+// TestValidation runs the schemas of the generated code on every operation.
+func TestValidation(t *testing.T) {
+	nc := connect(t)
+	b := natsbroker.New(nc)
+	validating := broker.WithValidator(schemavalidate.New())
+	ctx := context.Background()
+
+	// Publishing a value the document forbids fails before it is sent.
+	noItems := orders.Order{ID: "o-1", Status: "unknown"}
+	err := orders.NewProducer(b, validating).PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), noItems)
+	if !errors.Is(err, broker.ErrInvalidPayload) {
+		t.Errorf("publish: err = %v, want ErrInvalidPayload", err)
+	}
+
+	// Receiving one reaches the error handler instead of the handler.
+	errs := make(chan error, 1)
+	c := orders.NewConsumer(b, validating, broker.WithErrorHandler(func(err error) { errs <- err }))
+	sub, err := c.OnOrderCreated(func(_ context.Context, m broker.Received[orders.Order]) error {
+		t.Errorf("handler received %+v", m.Payload)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := orders.NewProducer(b).PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), noItems); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errs:
+		if !errors.Is(err, broker.ErrMalformed) {
+			t.Errorf("receive: err = %v, want ErrMalformed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	// An invalid request is answered with a 400, and an invalid reply is not sent.
+	srv, err := orders.NewServer(b, validating).ServeOrderStatus(func(context.Context, broker.Received[orders.StatusRequest]) (orders.StatusReply, error) {
+		return orders.StatusReply{OrderID: "o-1", Status: "unknown"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Unsubscribe()
+	var remote *broker.RemoteError
+	_, err = orders.NewClient(b).GetOrderStatus(ctx, orders.StatusRequest{OrderID: "o-1"})
+	if !errors.As(err, &remote) || remote.Code != "500" {
+		t.Errorf("invalid reply: err = %v, want a RemoteError with code 500", err)
 	}
 }

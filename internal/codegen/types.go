@@ -76,10 +76,10 @@ func (ts *typeSet) warn(format string, args ...any) {
 // warnIgnored warns about keywords that have no effect on the generated type.
 func (ts *typeSet) warnIgnored(s *spec.Schema, name string) {
 	if s.Not != nil {
-		ts.warn("%s: not is ignored", name)
+		ts.warn("%s: not is only enforced with broker.WithValidator", name)
 	}
 	if s.If != nil {
-		ts.warn("%s: if is ignored", name)
+		ts.warn("%s: if is only enforced with broker.WithValidator", name)
 	}
 }
 
@@ -280,7 +280,7 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 		}
 		sort.Strings(props)
 		if ap, ok := s.AdditionalProperties.(map[string]any); ok && len(ap) > 0 {
-			ts.warn("%s: additionalProperties is ignored on an object with properties", name)
+			ts.warn("%s: additionalProperties next to properties is only enforced with broker.WithValidator", name)
 		}
 		fields := map[string]bool{}
 		for _, p := range props {

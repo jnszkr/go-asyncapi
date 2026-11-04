@@ -27,6 +27,14 @@ const (
 {{- end}}{{end}}
 )
 {{end}}
+{{- if .Schemas}}
+// JSON Schemas of the payloads, checked with broker.WithValidator.
+const (
+{{- range .Schemas}}
+	{{.SchemaConst}} = {{literal .Schema}}
+{{- end}}
+)
+{{end}}
 {{- if .Channels}}
 // Channels.
 var (
@@ -49,6 +57,9 @@ var (
 {{- end}}{{end}}
 		},
 {{- end}}
+{{- if .Message}}{{if .Message.Schema}}
+		Schema: {{.Message.SchemaConst}},
+{{- end}}{{end}}
 	}
 {{- end}}
 )
@@ -91,7 +102,7 @@ func (c *{{$api.Name}}) {{.Name}}(ctx context.Context, {{template "params" .}}ms
 }
 {{- else if .IsSend}}
 func (c *{{$api.Name}}) {{.Name}}(ctx context.Context, {{template "params" .}}req {{.Message.Type}}, opts ...broker.MsgOption) ({{.Reply.Type}}, error) {
-	return broker.Request[{{.Message.Type}}, {{.Reply.Type}}](ctx, c.Client, {{.Channel.Name}}Channel, {{template "paramsArg" .}}, req, opts...)
+	return broker.Request[{{.Message.Type}}, {{.Reply.Type}}](ctx, c.Client, {{template "opChannel" .}}, {{template "paramsArg" .}}, req, opts...)
 }
 {{- else if not .Reply}}
 func (c *{{$api.Name}}) {{.Name}}(h broker.Handler[{{.Message.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
@@ -99,12 +110,13 @@ func (c *{{$api.Name}}) {{.Name}}(h broker.Handler[{{.Message.Type}}], opts ...b
 }
 {{- else}}
 func (c *{{$api.Name}}) {{.Name}}(h broker.Responder[{{.Message.Type}}, {{.Reply.Type}}], opts ...broker.SubOption) (broker.Subscription, error) {
-	return broker.Respond(c.Client, {{.Channel.Name}}Channel, h, {{template "subOpts" .}})
+	return broker.Respond(c.Client, {{template "opChannel" .}}, h, {{template "subOpts" .}})
 }
 {{- end}}
 {{end}}
 {{- end}}
 
+{{- define "opChannel"}}{{.Channel.Name}}Channel{{if .Reply.Schema}}.WithReplySchema({{.Reply.SchemaConst}}){{end}}{{end}}
 {{- define "params"}}{{if .Channel.HasParams}}params broker.Params, {{end}}{{end}}
 {{- define "paramsArg"}}{{if .Channel.HasParams}}params{{else}}nil{{end}}{{end}}
 {{- define "subOpts"}}{{if .Queue}}append([]broker.SubOption{broker.Queue({{printf "%q" .Queue}})}, opts...)...{{else}}opts...{{end}}{{end}}

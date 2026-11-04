@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +26,15 @@ func (JSON) ContentType() string                { return "application/json" }
 func (JSON) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
 func (JSON) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
+// Validator checks payloads against JSON Schemas. See schemavalidate for an
+// implementation.
+type Validator interface {
+	// Compile prepares a JSON Schema document. The function it returns reports
+	// why a payload does not conform to the schema. It must be safe for
+	// concurrent use.
+	Compile(schema string) (func(data []byte) error, error)
+}
+
 // Client pairs a Broker with a codec and error handling. It is the first
 // argument of the generic functions in this package.
 type Client struct {
@@ -30,6 +42,8 @@ type Client struct {
 	codec          Codec
 	onError        func(error)
 	requestTimeout time.Duration
+	validator      Validator
+	compiled       sync.Map // schema string → func([]byte) error
 }
 
 // Option configures a Client.
@@ -45,6 +59,18 @@ func WithErrorHandler(fn func(error)) Option { return func(c *Client) { c.onErro
 // WithRequestTimeout applies to requests whose context has no deadline.
 // The default is 5 seconds.
 func WithRequestTimeout(d time.Duration) Option { return func(c *Client) { c.requestTimeout = d } }
+
+// WithValidator checks the payloads the Client sends and receives against the
+// Schema and ReplySchema of their Channel. By default nothing is checked.
+//
+// A received payload that fails is treated as malformed: its error wraps both
+// ErrMalformed and ErrInvalidPayload. A payload about to be sent is not sent:
+// its error wraps only ErrInvalidPayload, so that a handler returning it does
+// not get the message it is handling dropped as malformed.
+//
+// Only JSON is checked: with a codec whose ContentType is not JSON, the
+// validator is not used.
+func WithValidator(v Validator) Option { return func(c *Client) { c.validator = v } }
 
 // New returns a Client on top of b.
 func New(b Broker, opts ...Option) *Client {
@@ -65,9 +91,13 @@ const (
 )
 
 // ErrMalformed wraps errors about messages that can never be handled, such
-// as undecodable payloads or subjects that don't match the channel. Brokers
-// with redelivery drop these instead of retrying them.
+// as undecodable or invalid payloads, or subjects that don't match the
+// channel. Brokers with redelivery drop these instead of retrying them.
 var ErrMalformed = errors.New("malformed message")
+
+// ErrInvalidPayload wraps errors about payloads that do not conform to their
+// schema. See WithValidator.
+var ErrInvalidPayload = errors.New("invalid payload")
 
 // RemoteError is returned by Request when the responder reported an error.
 type RemoteError struct {
@@ -114,7 +144,7 @@ func Publish[T any](ctx context.Context, c *Client, ch Channel[T], p Params, msg
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m, err := c.encode(ch, p, msg, opts)
+	m, err := c.encode(ch, ch.Schema, p, msg, opts)
 	if err != nil {
 		return err
 	}
@@ -124,7 +154,7 @@ func Publish[T any](ctx context.Context, c *Client, ch Channel[T], p Params, msg
 // Request sends req on ch and decodes the reply.
 func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p Params, req Req, opts ...MsgOption) (Resp, error) {
 	var resp Resp
-	m, err := c.encode(ch, p, req, opts)
+	m, err := c.encode(ch, ch.Schema, p, req, opts)
 	if err != nil {
 		return resp, err
 	}
@@ -140,6 +170,9 @@ func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p P
 	if desc := rm.Header.Get(HeaderServiceError); desc != "" {
 		return resp, &RemoteError{Code: rm.Header.Get(HeaderServiceErrorCode), Description: desc}
 	}
+	if err := c.validateReceived(ch.ReplySchema, rm.Data); err != nil {
+		return resp, fmt.Errorf("reply from %s: %w", m.Subject, err)
+	}
 	if err := c.codec.Unmarshal(rm.Data, &resp); err != nil {
 		return resp, fmt.Errorf("decode reply from %s: %w", m.Subject, err)
 	}
@@ -148,6 +181,9 @@ func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p P
 
 // Subscribe calls h for every message on ch, across all parameter values.
 func Subscribe[T any](c *Client, ch Channel[T], h Handler[T], opts ...SubOption) (Subscription, error) {
+	if _, err := c.checker(ch.Schema); err != nil {
+		return nil, err
+	}
 	return c.subscribe(ch.Pattern(), opts, func(m *Message) error {
 		r, err := decode(c, ch, m)
 		if err == nil {
@@ -164,6 +200,11 @@ func Subscribe[T any](c *Client, ch Channel[T], h Handler[T], opts ...SubOption)
 // Respond answers requests on ch with the value returned by h. Errors are
 // sent back to the requester, which receives them as *RemoteError.
 func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], opts ...SubOption) (Subscription, error) {
+	for _, schema := range []string{ch.Schema, ch.ReplySchema} {
+		if _, err := c.checker(schema); err != nil {
+			return nil, err
+		}
+	}
 	return c.subscribe(ch.Pattern(), opts, func(m *Message) error {
 		if m.Reply == "" {
 			err := fmt.Errorf("%s: %w: request without reply subject", m.Subject, ErrMalformed)
@@ -182,6 +223,9 @@ func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], 
 		if err != nil {
 			return c.respondError(m, "500", err)
 		}
+		if err := c.validate(ch.ReplySchema, data); err != nil {
+			return c.respondError(m, "500", err)
+		}
 		reply := &Message{Subject: m.Reply, Header: Header{}, Data: data}
 		reply.Header.Set(HeaderContentType, c.codec.ContentType())
 		if err := c.broker.Publish(context.Background(), reply); err != nil {
@@ -193,13 +237,16 @@ func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], 
 	})
 }
 
-func (c *Client) encode(ch channelSubject, p Params, payload any, opts []MsgOption) (*Message, error) {
+func (c *Client) encode(ch channelSubject, schema string, p Params, payload any, opts []MsgOption) (*Message, error) {
 	subject, err := ch.Subject(p)
 	if err != nil {
 		return nil, err
 	}
 	data, err := c.codec.Marshal(payload)
 	if err != nil {
+		return nil, fmt.Errorf("encode %s: %w", subject, err)
+	}
+	if err := c.validate(schema, data); err != nil {
 		return nil, fmt.Errorf("encode %s: %w", subject, err)
 	}
 	m := &Message{Subject: subject, Header: Header{}, Data: data}
@@ -224,10 +271,63 @@ func decode[T any](c *Client, ch Channel[T], m *Message) (Received[T], error) {
 	if r.Params, err = ch.ParseSubject(m.Subject); err != nil {
 		return r, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
+	if err := c.validateReceived(ch.Schema, m.Data); err != nil {
+		return r, err
+	}
 	if err := c.codec.Unmarshal(m.Data, &r.Payload); err != nil {
 		return r, fmt.Errorf("%w: decode: %w", ErrMalformed, err)
 	}
 	return r, nil
+}
+
+// checker returns the function checking payloads against schema, or nil when
+// they are not checked.
+func (c *Client) checker(schema string) (func([]byte) error, error) {
+	if c.validator == nil || schema == "" || !isJSON(c.codec.ContentType()) {
+		return nil, nil
+	}
+	if check, ok := c.compiled.Load(schema); ok {
+		return check.(func([]byte) error), nil
+	}
+	check, err := c.validator.Compile(schema)
+	if err != nil {
+		return nil, fmt.Errorf("compile schema: %w", err)
+	}
+	c.compiled.Store(schema, check)
+	return check, nil
+}
+
+// validate checks data against schema. Only a payload that fails the check
+// gives an error wrapping ErrInvalidPayload: a schema that cannot be compiled
+// says nothing about the payload.
+func (c *Client) validate(schema string, data []byte) error {
+	check, err := c.checker(schema)
+	if err != nil || check == nil {
+		return err
+	}
+	if err := check(data); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidPayload, err)
+	}
+	return nil
+}
+
+// validateReceived is validate for incoming payloads, which are malformed when
+// they fail the check.
+func (c *Client) validateReceived(schema string, data []byte) error {
+	err := c.validate(schema, data)
+	if errors.Is(err, ErrInvalidPayload) {
+		return fmt.Errorf("%w: %w", ErrMalformed, err)
+	}
+	return err
+}
+
+// isJSON reports whether contentType is JSON or a structured +json type.
+func isJSON(contentType string) bool {
+	media, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	return media == "application/json" || strings.HasSuffix(media, "+json")
 }
 
 func (c *Client) subscribe(subject string, opts []SubOption, h func(*Message) error) (Subscription, error) {
