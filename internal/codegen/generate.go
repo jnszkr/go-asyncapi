@@ -6,7 +6,10 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/token"
 	"slices"
 	"sort"
 	"strings"
@@ -60,6 +63,9 @@ type Options struct {
 	// and a part without operations is left out. All operations are
 	// validated regardless.
 	Parts []Part
+	// Warn receives what the generated code cannot express, such as a oneOf
+	// generated as json.RawMessage. It may be nil.
+	Warn func(string)
 }
 
 // Generate renders the Go source for doc.
@@ -67,18 +73,22 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 	if opts.Package == "" {
 		return nil, fmt.Errorf("package name is required")
 	}
-	m, err := buildModel(doc, opts.Package)
+	m, err := buildModel(doc, opts.Package, opts.Warn)
 	if err != nil {
 		return nil, err
 	}
 	if err := m.selectParts(opts.Parts); err != nil {
 		return nil, err
 	}
+	if len(m.Ops) > 0 {
+		if err := requireNATS(doc); err != nil {
+			return nil, err
+		}
+	}
 	m.Imports = imports(m)
 
 	tmpl, err := template.New("gen").Funcs(template.FuncMap{
-		"export": exportName,
-		"lines":  func(s string) []string { return strings.Split(strings.TrimSpace(s), "\n") },
+		"lines": func(s string) []string { return strings.Split(strings.TrimSpace(s), "\n") },
 	}).Parse(tmplSrc)
 	if err != nil {
 		return nil, err
@@ -92,7 +102,70 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 		// Return the unformatted source to ease debugging of the template.
 		return buf.Bytes(), fmt.Errorf("format generated code: %w", err)
 	}
+	if err := checkUniqueNames(src); err != nil {
+		return nil, err
+	}
 	return src, nil
+}
+
+// requireNATS rejects documents that only describe servers of other protocols,
+// since the operations are generated as NATS clients.
+func requireNATS(doc *spec.Document) error {
+	var others []string
+	for _, name := range sortedKeys(doc.Servers) {
+		server, _, err := doc.ResolveServer(doc.Servers[name])
+		if err != nil {
+			return fmt.Errorf("server %q: %w", name, err)
+		}
+		if strings.HasPrefix(strings.ToLower(server.Protocol), "nats") {
+			return nil
+		}
+		others = append(others, name+" ("+server.Protocol+")")
+	}
+	if len(others) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the document has no NATS server, only %s: select only the models part (-generate models) to use its types", strings.Join(others, ", "))
+}
+
+// checkUniqueNames reports names in the document that map to the same
+// generated identifier, which would otherwise surface as a compile error.
+func checkUniqueNames(src []byte) error {
+	f, err := parser.ParseFile(token.NewFileSet(), "", src, parser.SkipObjectResolution)
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	var dup string
+	add := func(name string) {
+		if seen[name] && dup == "" {
+			dup = name
+		}
+		seen[name] = true
+	}
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				add(d.Name.Name)
+			}
+		case *ast.GenDecl:
+			for _, sp := range d.Specs {
+				switch sp := sp.(type) {
+				case *ast.TypeSpec:
+					add(sp.Name.Name)
+				case *ast.ValueSpec:
+					for _, n := range sp.Names {
+						add(n.Name)
+					}
+				}
+			}
+		}
+	}
+	if dup != "" {
+		return fmt.Errorf("%s would be generated twice: rename what it is generated from, since names that differ only in punctuation or case map to one Go name", dup)
+	}
+	return nil
 }
 
 // imports returns the imports used by the generated file, other than broker.

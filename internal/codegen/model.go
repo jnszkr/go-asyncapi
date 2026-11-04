@@ -68,11 +68,17 @@ func (c *channel) HasAllowed() bool {
 	return false
 }
 
+// HasDefaults reports whether any parameter has a default value.
+func (c *channel) HasDefaults() bool {
+	return slices.ContainsFunc(c.Params, func(p param) bool { return p.Default != "" })
+}
+
 type param struct {
-	Arg  string // Go parameter name
-	Key  string // name in the address
-	Doc  string
-	Enum []string
+	Arg     string // Go parameter name
+	Key     string // name in the address
+	Doc     string
+	Enum    []string
+	Default string
 }
 
 type message struct {
@@ -173,25 +179,32 @@ type builder struct {
 	doc      *spec.Document
 	types    *typeSet
 	channels map[string]*channel
-	messages map[string]*message
+	messages map[string]*message // by canonical ref
+	msgNames map[string]bool
 	headers  []*headerDecl
 }
 
-func buildModel(doc *spec.Document, pkg string) (*model, error) {
+func buildModel(doc *spec.Document, pkg string, warn func(string)) (*model, error) {
 	b := &builder{
 		doc:      doc,
-		types:    newTypeSet(doc),
+		types:    newTypeSet(doc, warn),
 		channels: map[string]*channel{},
 		messages: map[string]*message{},
+		msgNames: map[string]bool{},
 	}
 	m := &model{Package: pkg, Title: doc.Info.Title, Version: doc.Info.Version}
 
 	opKeys := sortedKeys(doc.Operations)
+	opNames := map[string]string{}
 	for _, key := range opKeys {
 		op, err := b.operation(key, doc.Operations[key])
 		if err != nil {
 			return nil, fmt.Errorf("operation %q: %w", key, err)
 		}
+		if other, ok := opNames[op.Name]; ok {
+			return nil, fmt.Errorf("operations %q and %q have the same Go name %s", other, key, op.Name)
+		}
+		opNames[op.Name] = key
 		m.Ops = append(m.Ops, op)
 	}
 	// Component schemas are emitted even when no operation uses them.
@@ -205,6 +218,7 @@ func buildModel(doc *spec.Document, pkg string) (*model, error) {
 		m.Channels = append(m.Channels, b.channels[key])
 	}
 	sort.Slice(b.types.decls, func(i, j int) bool { return b.types.decls[i].Name < b.types.decls[j].Name })
+	breakRecursion(b.types.decls)
 	m.Types = b.types.decls
 	m.Headers = b.headers
 	for imp := range b.types.imports {
@@ -223,8 +237,14 @@ func (b *builder) operation(key string, raw *spec.Operation) (*operation, error)
 	if err != nil {
 		return nil, err
 	}
+	name := exportName(key)
+	if name == "Client" {
+		// The generated types embed *broker.Client, and a method cannot share
+		// its name with a field.
+		name = "ClientOp"
+	}
 	o := &operation{
-		Name:    exportName(key),
+		Name:    name,
 		Key:     key,
 		Doc:     firstNonEmpty(op.Description, op.Summary, op.Title),
 		Action:  op.Action,
@@ -249,9 +269,21 @@ func (b *builder) operation(key string, raw *spec.Operation) (*operation, error)
 		if err != nil {
 			return nil, fmt.Errorf("reply: %w", err)
 		}
+		// Requests get their reply on the subject NATS provides with the
+		// request, which leaves no address to honour.
+		if reply.Address != nil {
+			return nil, fmt.Errorf("reply.address is not supported: replies go to the NATS reply subject of the request, so remove it")
+		}
 		chRef := ""
 		if reply.Channel != nil {
 			chRef = reply.Channel.Ref
+			replyCh, replyKey, err := b.doc.ChannelByRef(chRef)
+			if err != nil {
+				return nil, fmt.Errorf("reply: %w", err)
+			}
+			if replyCh.Address != nil {
+				return nil, fmt.Errorf("reply channel %q has fixed address %q, which is not supported: replies go to the NATS reply subject of the request, so set address: null", replyKey, *replyCh.Address)
+			}
 		}
 		if o.Reply, err = b.singleMessage(reply.Messages, chRef); err != nil {
 			return nil, fmt.Errorf("reply: %w", err)
@@ -284,6 +316,13 @@ func (b *builder) singleMessage(refs []*spec.Reference, channelRef string) (*mes
 }
 
 func (b *builder) message(ref string) (*message, error) {
+	canonical, err := b.doc.CanonicalRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := b.messages[canonical]; ok {
+		return m, nil
+	}
 	msg, name, err := b.doc.MessageByRef(ref)
 	if err != nil {
 		return nil, err
@@ -291,11 +330,11 @@ func (b *builder) message(ref string) (*message, error) {
 	if msg.Name != "" {
 		name = msg.Name
 	}
-	goName := exportName(name)
-	if m, ok := b.messages[goName]; ok {
-		return m, nil
-	}
+	goName := b.messageName(canonical, name)
 	m := &message{Name: goName, ContentType: firstNonEmpty(msg.ContentType, b.doc.DefaultContentType, "application/json")}
+	if !strings.Contains(strings.ToLower(m.ContentType), "json") {
+		b.types.warn("message %q: content type %q needs a matching codec: the default is JSON, set one with broker.WithCodec", name, m.ContentType)
+	}
 	if m.Type, err = b.types.namedType(msg.Payload, goName); err != nil {
 		return nil, fmt.Errorf("message %q payload: %w", name, err)
 	}
@@ -304,8 +343,24 @@ func (b *builder) message(ref string) (*message, error) {
 			return nil, fmt.Errorf("message %q headers: %w", name, err)
 		}
 	}
-	b.messages[goName] = m
+	b.messages[canonical] = m
 	return m, nil
+}
+
+// messageName returns a Go name no other message uses. Messages are named by
+// their key or name, which only have to be unique within their channel or
+// components section.
+func (b *builder) messageName(canonical, name string) string {
+	goName := exportName(name)
+	if b.msgNames[goName] {
+		if rest, ok := strings.CutPrefix(canonical, "#/channels/"); ok {
+			channelKey, _, _ := strings.Cut(rest, "/")
+			goName = exportName(channelKey) + goName
+		} else {
+			goName = exportName(spec.RefName(canonical))
+		}
+	}
+	return uniqueIn(b.msgNames, goName)
 }
 
 // headerDecl records the header names of a message's headers schema.
@@ -346,6 +401,7 @@ func (b *builder) channel(ref string) (*channel, error) {
 		Doc:     firstNonEmpty(ch.Description, ch.Summary, ch.Title),
 		Address: *ch.Address,
 	}
+	args := map[string]bool{}
 	for tok := range strings.SplitSeq(c.Address, ".") {
 		if tok == "" {
 			return nil, fmt.Errorf("channel %q: empty token in subject %q", key, c.Address)
@@ -361,13 +417,16 @@ func (b *builder) channel(ref string) (*channel, error) {
 			return nil, fmt.Errorf("channel %q: parameter must span a whole subject token, got %q", key, tok)
 		}
 		pkey := tok[sm[0][2]:sm[0][3]]
-		p := param{Arg: argName(pkey), Key: pkey}
+		p := param{Arg: uniqueIn(args, argName(pkey)), Key: pkey}
 		if raw, ok := ch.Parameters[pkey]; ok {
 			def, _, err := b.doc.ResolveParameter(raw)
 			if err != nil {
 				return nil, fmt.Errorf("channel %q parameter %q: %w", key, pkey, err)
 			}
-			p.Doc, p.Enum = def.Description, def.Enum
+			p.Doc, p.Enum, p.Default = def.Description, def.Enum, def.Default
+			if def.Location != "" {
+				b.types.warn("channel %q parameter %q: location is ignored, pass the value in the parameters", key, pkey)
+			}
 		}
 		c.Params = append(c.Params, p)
 	}

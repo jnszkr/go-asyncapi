@@ -312,6 +312,7 @@ info: {title: t, version: "1"}
 channels:
   c:
     address: user-{id}.x
+    parameters: {id: {}}
     messages: {m: {payload: {type: string}}}
 operations:
   o: {action: send, channel: {$ref: '#/channels/c'}}
@@ -352,7 +353,7 @@ operations:
 		"asyncapi 2": {`
 asyncapi: 2.6.0
 info: {title: t, version: "1"}
-`, "only 3.x"},
+`, "only 3.0 and 3.1"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

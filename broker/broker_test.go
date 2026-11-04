@@ -130,3 +130,24 @@ func TestRequestRespond(t *testing.T) {
 		t.Errorf("err = %v, want RemoteError 500", err)
 	}
 }
+
+func TestChannelDefaults(t *testing.T) {
+	ch := broker.Channel[string]{
+		Address:  "a.{region}.{id}",
+		Allowed:  map[string][]string{"region": {"eu"}},
+		Defaults: map[string]string{"region": "eu"},
+	}
+	got, err := ch.Subject(broker.Params{"id": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "a.eu.1" {
+		t.Errorf("subject = %q, want the default region", got)
+	}
+	if _, err := ch.Subject(broker.Params{"region": "us", "id": "1"}); err == nil {
+		t.Error("a value outside Allowed was accepted")
+	}
+	if _, err := ch.Subject(broker.Params{}); err == nil {
+		t.Error("a parameter without a value or default was accepted")
+	}
+}
