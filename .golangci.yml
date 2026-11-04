@@ -1,0 +1,26 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - misspell
+    - nolintlint
+    - unconvert
+    - unparam
+  exclusions:
+    rules:
+      # Tests defer Unsubscribe for cleanup; a failure there is not the test's subject.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  # Report everything, so a local run matches what CI fails on.
+  max-issues-per-linter: 0
+  max-same-issues: 0

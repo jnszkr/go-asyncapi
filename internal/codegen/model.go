@@ -85,7 +85,7 @@ type operation struct {
 	Queue   string
 }
 
-func (o *operation) IsSend() bool    { return o.Action == spec.ActionSend }
+func (o *operation) IsSend() bool { return o.Action == spec.ActionSend }
 
 // HasReceive reports whether any operation subscribes.
 func (m *model) HasReceive() bool {

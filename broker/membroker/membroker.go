@@ -81,14 +81,14 @@ func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Messag
 		}
 		return nil
 	})
-	defer s.Unsubscribe()
+	defer func() { _ = s.Unsubscribe() }()
 
 	req := clone(m)
 	req.Reply = inbox
 	if len(b.targets(req.Subject)) == 0 {
 		return nil, errNoResponders
 	}
-	go b.Publish(ctx, req)
+	go func() { _ = b.Publish(ctx, req) }()
 	select {
 	case r := <-replies:
 		return r, nil
