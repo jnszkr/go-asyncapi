@@ -7,15 +7,24 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  lint:
+    uses: ./.github/workflows/lint.yml
+
   release:
+    needs: [test, lint]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,7 +33,6 @@ jobs:
         with:
           # go.mod holds the minimum version; binaries use the current release.
           go-version: stable
-      - run: go test ./...
 
       - id: semrel
         uses: go-semantic-release/action@v1
