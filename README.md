@@ -1,5 +1,8 @@
 # go-asyncapi
 
+[![build](https://img.shields.io/github/actions/workflow/status/jnszkr/go-asyncapi/ci.yml?branch=main&label=build)](https://github.com/jnszkr/go-asyncapi/actions/workflows/ci.yml)
+[![lint](https://img.shields.io/github/actions/workflow/status/jnszkr/go-asyncapi/lint.yml?branch=main&label=lint)](https://github.com/jnszkr/go-asyncapi/actions/workflows/lint.yml)
+
 Generate typed Go clients for [NATS](https://nats.io) from
 [AsyncAPI 3.0](https://www.asyncapi.com/docs/reference/specification/v3.0.0) documents,
 including the [NATS bindings](https://github.com/asyncapi/bindings/blob/master/nats/README.md).
@@ -159,6 +162,7 @@ Early MVP. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and current limitati
 ```sh
 go test ./...                        # broker, golden and integration tests (embedded nats-server)
 go test ./internal/codegen -update   # refresh golden files after template changes
+golangci-lint run                    # lint (v2, same checks as CI; config in .golangci.yml)
 ```
 
 ## Contributing
