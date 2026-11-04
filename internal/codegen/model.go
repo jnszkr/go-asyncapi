@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jnszkr/go-asyncapi/broker/schemavalidate"
 	"github.com/jnszkr/go-asyncapi/internal/spec"
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +24,7 @@ type model struct {
 	Channels []*channel
 	Ops      []*operation
 	APIs     []*apiType
+	Schemas  []*message // messages whose payload schema is declared
 }
 
 // apiType is a generated type holding the operations of one Part.
@@ -50,6 +52,7 @@ type channel struct {
 	Address string
 	Payload string // Go type of the messages on this channel
 	Params  []param
+	Message *message // message whose schema the channel carries, if any
 }
 
 func (c *channel) HasParams() bool { return len(c.Params) > 0 }
@@ -85,7 +88,11 @@ type message struct {
 	Name        string
 	Type        string // Go payload type
 	ContentType string
+	Schema      string // JSON Schema of the payload, if it can be validated
 }
+
+// SchemaConst is the name of the constant holding the schema.
+func (m *message) SchemaConst() string { return "schema" + m.Name }
 
 // headerDecl lists the header names of a message as constants.
 type headerDecl struct {
@@ -152,6 +159,7 @@ func (m *model) selectParts(parts []Part) error {
 	}
 	m.Ops = ops
 	m.Channels = slices.DeleteFunc(m.Channels, func(c *channel) bool { return !used[c] })
+	m.declareSchemas()
 
 	for _, t := range apiTypes {
 		api := &apiType{Name: t.name, Role: t.role}
@@ -171,6 +179,24 @@ func (m *model) selectParts(parts []Part) error {
 		m.APIs = append(m.APIs, api)
 	}
 	return nil
+}
+
+// declareSchemas lists the schemas the selected operations refer to.
+func (m *model) declareSchemas() {
+	seen := map[*message]bool{}
+	add := func(msg *message) {
+		if msg != nil && msg.Schema != "" && !seen[msg] {
+			seen[msg] = true
+			m.Schemas = append(m.Schemas, msg)
+		}
+	}
+	for _, c := range m.Channels {
+		add(c.Message)
+	}
+	for _, o := range m.Ops {
+		add(o.Reply)
+	}
+	sort.Slice(m.Schemas, func(i, j int) bool { return m.Schemas[i].Name < m.Schemas[j].Name })
 }
 
 var paramRe = regexp.MustCompile(`\{([^{}]+)\}`)
@@ -259,7 +285,13 @@ func (b *builder) operation(key string, raw *spec.Operation) (*operation, error)
 	switch ch.Payload {
 	case "":
 		ch.Payload = o.Message.Type
+		ch.Message = o.Message
 	case o.Message.Type:
+		// Messages sharing a type share a schema, unless one of them is not JSON.
+		if ch.Message != nil && ch.Message.Schema != o.Message.Schema {
+			b.types.warn("channel %q: its messages differ in being JSON, so payloads are not validated", ch.Key)
+			ch.Message = nil
+		}
 	default:
 		// TODO(phase 2): channels carrying several message types.
 		return nil, fmt.Errorf("channel %q carries both %s and %s: one message type per channel is supported", ch.Key, ch.Payload, o.Message.Type)
@@ -332,7 +364,7 @@ func (b *builder) message(ref string) (*message, error) {
 	}
 	goName := b.messageName(canonical, name)
 	m := &message{Name: goName, ContentType: firstNonEmpty(msg.ContentType, b.doc.DefaultContentType, "application/json")}
-	if !strings.Contains(strings.ToLower(m.ContentType), "json") {
+	if !isJSON(m.ContentType) {
 		b.types.warn("message %q: content type %q needs a matching codec: the default is JSON, set one with broker.WithCodec", name, m.ContentType)
 	}
 	if m.Type, err = b.types.namedType(msg.Payload, goName); err != nil {
@@ -343,8 +375,32 @@ func (b *builder) message(ref string) (*message, error) {
 			return nil, fmt.Errorf("message %q headers: %w", name, err)
 		}
 	}
+	m.Schema = b.payloadSchema(msg, name, m.ContentType)
 	b.messages[canonical] = m
 	return m, nil
+}
+
+// payloadSchema returns the schema to validate a message's payload with. A
+// schema that cannot be used only costs validation, so it is a warning:
+// generated types do not depend on it.
+func (b *builder) payloadSchema(msg *spec.Message, name, contentType string) string {
+	if !isJSON(contentType) {
+		return ""
+	}
+	schema, err := b.doc.PayloadSchema(msg)
+	if err == nil && schema != "" {
+		_, err = schemavalidate.New().Compile(schema)
+	}
+	if err != nil {
+		b.types.warn("message %q: payload is not validated by broker.WithValidator: %v", name, err)
+		return ""
+	}
+	return schema
+}
+
+// isJSON reports whether a message's content type is JSON.
+func isJSON(contentType string) bool {
+	return strings.Contains(strings.ToLower(contentType), "json")
 }
 
 // messageName returns a Go name no other message uses. Messages are named by

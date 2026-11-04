@@ -2,7 +2,9 @@ package broker_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jnszkr/go-asyncapi/broker"
@@ -149,5 +151,116 @@ func TestChannelDefaults(t *testing.T) {
 	}
 	if _, err := ch.Subject(broker.Params{}); err == nil {
 		t.Error("a parameter without a value or default was accepted")
+	}
+}
+
+// rejectBad is a Validator rejecting the payload `"bad"` under any schema
+// except "uncompilable". It counts compilations.
+type rejectBad struct{ compiled *atomic.Int32 }
+
+func (v rejectBad) Compile(schema string) (func([]byte) error, error) {
+	v.compiled.Add(1)
+	if schema == "uncompilable" {
+		return nil, errors.New("cannot compile")
+	}
+	return func(data []byte) error {
+		if string(data) == `"bad"` {
+			return errors.New("rejected")
+		}
+		return nil
+	}, nil
+}
+
+var validated = broker.Channel[string]{Address: "validated", Schema: "s"}
+
+func TestValidationIsOptional(t *testing.T) {
+	c := broker.New(membroker.New())
+	var got string
+	if _, err := broker.Subscribe(c, validated, func(_ context.Context, m broker.Received[string]) error {
+		got = m.Payload
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Publish(context.Background(), c, validated, nil, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	if got != "bad" {
+		t.Errorf("received %q", got)
+	}
+}
+
+func TestChannelWithoutSchemaIsNotValidated(t *testing.T) {
+	c := broker.New(membroker.New(), broker.WithValidator(rejectBad{new(atomic.Int32)}))
+	plain := broker.Channel[string]{Address: "validated"}
+	if err := broker.Publish(context.Background(), c, plain, nil, "bad"); err != nil {
+		t.Error(err)
+	}
+}
+
+type textCodec struct{ contentType string }
+
+func (c textCodec) ContentType() string           { return c.contentType }
+func (textCodec) Marshal(v any) ([]byte, error)   { return json.Marshal(v) }
+func (textCodec) Unmarshal(d []byte, v any) error { return json.Unmarshal(d, v) }
+
+func TestValidationFollowsCodec(t *testing.T) {
+	for contentType, validates := range map[string]bool{
+		"application/json":                true,
+		"Application/JSON; charset=utf-8": true,
+		"application/cloudevents+json":    true,
+		"application/x-protobuf":          false,
+		"text/plain":                      false,
+		"application/jsonish":             false,
+	} {
+		c := broker.New(membroker.New(), broker.WithCodec(textCodec{contentType}),
+			broker.WithValidator(rejectBad{new(atomic.Int32)}))
+		err := broker.Publish(context.Background(), c, validated, nil, "bad")
+		if got := errors.Is(err, broker.ErrInvalidPayload); got != validates {
+			t.Errorf("%s: err = %v, want validated = %v", contentType, err, validates)
+		}
+	}
+}
+
+func TestSchemasAreCompiledOnce(t *testing.T) {
+	var compiled atomic.Int32
+	c := broker.New(membroker.New(), broker.WithValidator(rejectBad{&compiled}))
+	if _, err := broker.Subscribe(c, validated, func(context.Context, broker.Received[string]) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := broker.Publish(context.Background(), c, validated, nil, "ok"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := compiled.Load(); n != 1 {
+		t.Errorf("compiled %d times, want 1", n)
+	}
+}
+
+// TestUncompilableSchema checks that a schema the Validator cannot use fails
+// when subscribing, not by rejecting every message as malformed.
+func TestUncompilableSchema(t *testing.T) {
+	c := broker.New(membroker.New(), broker.WithValidator(rejectBad{new(atomic.Int32)}))
+	ch := broker.Channel[string]{Address: "validated", Schema: "uncompilable"}
+	if _, err := broker.Subscribe(c, ch, func(context.Context, broker.Received[string]) error { return nil }); err == nil {
+		t.Error("Subscribe: expected an error")
+	}
+	if _, err := broker.Respond(c, ch, func(context.Context, broker.Received[string]) (string, error) { return "", nil }); err == nil {
+		t.Error("Respond: expected an error")
+	}
+	reply := validated.WithReplySchema("uncompilable")
+	if _, err := broker.Respond(c, reply, func(context.Context, broker.Received[string]) (string, error) { return "", nil }); err == nil {
+		t.Error("Respond with a reply schema: expected an error")
+	}
+	err := broker.Publish(context.Background(), c, ch, nil, "ok")
+	if err == nil || errors.Is(err, broker.ErrInvalidPayload) || errors.Is(err, broker.ErrMalformed) {
+		t.Errorf("Publish: err = %v, want a schema error", err)
+	}
+}
+
+func TestWithReplySchemaLeavesChannelUnchanged(t *testing.T) {
+	if got := validated.WithReplySchema("r"); got.ReplySchema != "r" || got.Schema != "s" || validated.ReplySchema != "" {
+		t.Errorf("got %+v, original %+v", got, validated)
 	}
 }

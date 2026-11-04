@@ -54,6 +54,7 @@ broker/              generic, transport-agnostic runtime
 broker/natsbroker    Broker on a *nats.Conn (core NATS)
 broker/jsbroker      Broker on JetStream, consuming from consumers you create
 broker/membroker     in-memory Broker for tests
+broker/schemavalidate  optional payload validation with JSON Schema draft-07
 ```
 
 The generated package contains only plain models, channel definitions, header-name
@@ -137,6 +138,46 @@ brokers reject `jsbroker.From`.
 Request/reply is not stored: `Request` goes over core NATS, and a `Server` should run on
 `natsbroker`.
 
+### Validation
+
+Decoding only checks that a payload fits the Go types. To check payloads against their
+schemas, including `required`, `minimum`, `pattern`, `enum`, `not` and `if`, pass a validator:
+
+```go
+consumer := orders.NewConsumer(b, broker.WithValidator(schemavalidate.New()))
+```
+
+It is off by default, and `broker` itself does not depend on a JSON Schema library: only
+programs importing `broker/schemavalidate` link one. The generated channels carry each
+message's schema with its `$ref`s resolved (`-generate models` does not include them).
+
+| Payload that fails | Result |
+|---|---|
+| received by `Subscribe` | not handled; goes to `WithErrorHandler`, and `jsbroker` terminates it instead of redelivering |
+| request received by `Respond` | answered with a 400 `*broker.RemoteError` |
+| about to be sent by `Publish` or `Request` | not sent; the call returns the error |
+| reply about to be sent by `Respond` | not sent; the requester gets a 500 `*broker.RemoteError` |
+| reply received by `Request` | the call returns the error |
+
+Errors wrap `broker.ErrInvalidPayload`, and those about received payloads also wrap
+`broker.ErrMalformed`. A failure to send does not, so a handler returning it has its message
+redelivered rather than dropped.
+
+Each generated type has its own options, so validate only what you want: a `Consumer` with a
+validator next to a `Producer` without one checks incoming messages alone. A `Client` or
+`Server` checks both directions.
+
+- Only JSON is checked: with a `broker.WithCodec` that is not JSON, the validator is not used,
+  and neither is it for a message whose `contentType` is not JSON.
+- Message `headers` are not checked.
+- Calling `broker.Request` or `broker.Respond` directly with a generated channel checks the
+  request but not the reply, since the reply schema belongs to the operation: use the generated
+  methods, or `Channel.WithReplySchema`.
+- `pattern` uses the syntax of Go's `regexp`, so lookaheads are not available. `format` is
+  checked for the formats draft-07 defines.
+- A schema that cannot be compiled makes `Subscribe` and `Respond` fail, rather than rejecting
+  every message.
+
 ## Mapping
 
 | AsyncAPI | Go |
@@ -200,12 +241,15 @@ What is generated with less detail than the document has is printed as a warning
 stderr, and generation continues:
 
 - `oneOf` and `anyOf` as `json.RawMessage`
-- `not`, `if` and `additionalProperties` next to `properties` are ignored
+- `not`, `if` and `additionalProperties` next to `properties` are not part of the Go types,
+  and are only enforced with [`broker.WithValidator`](#validation)
+- a message's payload is left out of validation when its schema cannot be used, such as a
+  `$ref` outside the document or a `pattern` Go's `regexp` cannot read
 - parameter `location` is ignored; values are passed in the parameters
 - a non-JSON `contentType` needs a codec set with `broker.WithCodec`
 
-Other validation keywords, such as `minimum` or `pattern`, are not enforced, and a `const`
-is only documented on its field.
+Other validation keywords, such as `minimum` or `pattern`, are likewise only enforced with
+`broker.WithValidator`, and a `const` is otherwise only documented on its field.
 
 ## Status
 
