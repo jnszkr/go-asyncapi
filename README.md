@@ -148,9 +148,38 @@ Request/reply is not stored: `Request` goes over core NATS, and a `Server` shoul
 | `receive` operation | `Consumer` method calling `broker.Subscribe`, with `broker.Queue` when `bindings.nats.queue` is set |
 | `receive` + `reply` | `Server` method calling `broker.Respond` |
 | message `headers` | header-name constants; values are passed with `broker.WithHeader` |
+| `x-go-type` on a schema | your existing Go type instead of a generated one |
 
 Responder errors are sent back using the `Nats-Service-Error` / `Nats-Service-Error-Code`
 headers and surface as `*broker.RemoteError` on the requesting side.
+
+### Using your own types
+
+Add `x-go-type` to a schema to use an existing Go type instead of generating one, with
+`x-go-type-import` for the import path of its package:
+
+```yaml
+components:
+  schemas:
+    Order:
+      type: object
+      x-go-type: mymodels.Order
+      x-go-type-import: github.com/you/app/mymodels
+      properties: ...
+```
+
+A component schema becomes an alias, so `orders.Order` and `mymodels.Order` are the same
+type and handlers receive your struct:
+
+```go
+type Order = mymodels.Order
+```
+
+Inline schemas, such as a property, use the type directly. The value is any Go type
+expression (`time.Duration`, `[]mymodels.Order`, `*url.URL`) from at most one imported
+package. The rest of the schema is not checked against your type, so it has to decode the
+same JSON itself. `x-go-type` next to a `$ref` is ignored: put it on the schema the
+`$ref` points to.
 
 ## Status
 
