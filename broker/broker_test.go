@@ -264,3 +264,36 @@ func TestWithReplySchemaLeavesChannelUnchanged(t *testing.T) {
 		t.Errorf("got %+v, original %+v", got, validated)
 	}
 }
+
+// TestEmptyBracesAreNotAParameter keeps "{}" a literal token: a parameter
+// needs a name.
+func TestEmptyBracesAreNotAParameter(t *testing.T) {
+	ch := broker.Channel[greeting]{Address: "a.{}"}
+	if p, err := ch.ParseSubject("a.x"); err == nil {
+		t.Errorf("ParseSubject(a.x) = %v, want mismatch error", p)
+	}
+	if p, err := ch.ParseSubject("a.{}"); err != nil || len(p) != 0 {
+		t.Errorf("ParseSubject(a.{}) = %v, %v; want no parameters", p, err)
+	}
+	if got := ch.Pattern(); got != "a.{}" {
+		t.Errorf("Pattern = %q, want a.{}", got)
+	}
+}
+
+// TestSuccessfulReplyReportsNoError checks that sending a reply is not
+// mistaken for a failure.
+func TestSuccessfulReplyReportsNoError(t *testing.T) {
+	var reported []error
+	c := broker.New(membroker.New(), broker.WithErrorHandler(func(err error) { reported = append(reported, err) }))
+	if _, err := broker.Respond(c, measure, func(_ context.Context, m broker.Received[greeting]) (length, error) {
+		return length{N: len(m.Payload.Text)}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broker.Request[greeting, length](context.Background(), c, measure, nil, greeting{Text: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reported) != 0 {
+		t.Errorf("reported %v, want nothing", reported)
+	}
+}

@@ -3,6 +3,7 @@ package natsbroker_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,5 +126,35 @@ func TestRequestReplyInterceptors(t *testing.T) {
 	}
 	if servedBy != "test" {
 		t.Errorf("Served-By = %q", servedBy)
+	}
+}
+
+// TestQueueSubscribersShareMessages checks that a queue group delivers each
+// message to one member, not to all of them.
+func TestQueueSubscribersShareMessages(t *testing.T) {
+	c := broker.New(setup(t))
+	var got atomic.Int32
+	for range 2 {
+		if _, err := broker.Subscribe(c, greetings, func(context.Context, broker.Received[greeting]) error {
+			got.Add(1)
+			return nil
+		}, broker.Queue("workers")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const n = 10
+	for range n {
+		if err := broker.Publish(context.Background(), c, greetings, nil, greeting{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for got.Load() < n && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give any duplicate deliveries time to arrive.
+	time.Sleep(100 * time.Millisecond)
+	if v := got.Load(); v != n {
+		t.Errorf("handled %d messages, want %d", v, n)
 	}
 }
