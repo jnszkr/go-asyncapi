@@ -72,10 +72,10 @@ func splitWords(s string) []string {
 // argName returns an unexported Go identifier for use as a function
 // parameter ("userId" → "userID", "type" → "type_").
 func argName(s string) string {
+	// exportName never returns an empty name, so there is a first word.
 	name := exportName(s)
-	words := splitWords(name)
-	if len(words) > 0 && commonInitialisms[strings.ToUpper(words[0])] {
-		name = strings.ToLower(words[0]) + name[len(words[0]):]
+	if first := splitWords(name)[0]; commonInitialisms[strings.ToUpper(first)] {
+		name = strings.ToLower(first) + name[len(first):]
 	} else {
 		r := []rune(name)
 		r[0] = unicode.ToLower(r[0])

@@ -1,0 +1,15 @@
+# Mutation testing with gremlins (https://gremlins.dev); see AGENTS.md.
+# Run from the module root:  gremlins unleash
+unleash:
+  exclude-files:
+    # Third-party code and generated example output are not ours to test.
+    - "^vendor/"
+    - "^examples/"
+  # A mutant's timeout is this multiple of the coverage run's duration.
+  timeout-coefficient: 10
+  threshold:
+    # KILLED / (KILLED + LIVED). Was 97.3% when introduced; the LIVED rest
+    # are equivalent mutants (e.g. sort comparators over unique keys).
+    efficacy: 95
+    # (KILLED + LIVED) / all mutants, i.e. how much code tests reach.
+    mutant-coverage: 84
