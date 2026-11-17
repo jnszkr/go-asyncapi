@@ -3,6 +3,7 @@ package spec
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"regexp"
@@ -328,14 +329,9 @@ func mergePatch(target, patch any) any {
 	if !ok {
 		return patch
 	}
-	t, ok := target.(map[string]any)
-	if !ok {
-		t = nil
-	}
-	out := make(map[string]any, len(t)+len(p))
-	for k, v := range t {
-		out[k] = v
-	}
+	t, _ := target.(map[string]any) // nil unless target is an object
+	out := map[string]any{}
+	maps.Copy(out, t)
 	for k, v := range p {
 		if v == nil {
 			delete(out, k)

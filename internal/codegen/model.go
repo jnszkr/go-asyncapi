@@ -200,7 +200,7 @@ func (m *model) declareSchemas() {
 	for _, o := range m.Ops {
 		add(o.Reply)
 	}
-	sort.Slice(m.Schemas, func(i, j int) bool { return m.Schemas[i].Name < m.Schemas[j].Name })
+	slices.SortFunc(m.Schemas, func(a, b *message) int { return strings.Compare(a.Name, b.Name) })
 }
 
 var paramRe = regexp.MustCompile(`\{([^{}]+)\}`)
@@ -247,7 +247,7 @@ func buildModel(doc *spec.Document, pkg string, warn func(string)) (*model, erro
 	for _, key := range sortedKeys(b.channels) {
 		m.Channels = append(m.Channels, b.channels[key])
 	}
-	sort.Slice(b.types.decls, func(i, j int) bool { return b.types.decls[i].Name < b.types.decls[j].Name })
+	slices.SortFunc(b.types.decls, func(a, b *typeDecl) int { return strings.Compare(a.Name, b.Name) })
 	breakRecursion(b.types.decls)
 	m.Types = b.types.decls
 	m.Headers = b.headers
@@ -466,17 +466,18 @@ func (b *builder) channel(ref string) (*channel, error) {
 		if tok == "" {
 			return nil, fmt.Errorf("channel %q: empty token in subject %q", key, c.Address)
 		}
-		sm := paramRe.FindAllStringSubmatchIndex(tok, -1)
-		if len(sm) == 0 {
+		sm := paramRe.FindStringSubmatchIndex(tok)
+		if sm == nil {
 			if strings.ContainsAny(tok, "*> \t") {
 				return nil, fmt.Errorf("channel %q: wildcards in addresses are not supported, use parameters", key)
 			}
 			continue
 		}
-		if len(sm) > 1 || sm[0][0] != 0 || sm[0][1] != len(tok) {
+		// One parameter spanning the token also rules out a second one in it.
+		if sm[0] != 0 || sm[1] != len(tok) {
 			return nil, fmt.Errorf("channel %q: parameter must span a whole subject token, got %q", key, tok)
 		}
-		pkey := tok[sm[0][2]:sm[0][3]]
+		pkey := tok[sm[2]:sm[3]]
 		p := param{Arg: uniqueIn(args, argName(pkey)), Key: pkey}
 		if raw, ok := ch.Parameters[pkey]; ok {
 			def, _, err := b.doc.ResolveParameter(raw)

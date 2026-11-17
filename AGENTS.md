@@ -55,6 +55,8 @@ Use it in two places:
 
   The path covers that directory and everything below it. Each mutant's timeout is a multiple of how long the coverage run took, and that run is short for a single small package, so without the larger coefficient most mutants are wrongly reported as `TIMED OUT`.
 
+  Do not raise the coefficient for `internal/codegen`. Its coverage run is already long, and some of its mutants recurse or loop forever, taking more memory until they time out; a larger coefficient lets them grow until the machine runs out of memory. A `TIMED OUT` mutant does not count against the efficacy threshold.
+
   Add or tighten tests until every `LIVED` mutant in the code you are working on is `KILLED`. If a mutant cannot be killed because it does not change behaviour (an equivalent mutant), say so in the PR description rather than writing a test that pins an implementation detail.
 
 - **Before every push**, run it on the whole module. It must exit cleanly, which means it met the thresholds in `.gremlins.yaml`:
