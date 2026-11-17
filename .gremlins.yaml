@@ -7,6 +7,10 @@ unleash:
     - "^examples/"
   # A mutant's timeout is this multiple of the coverage run's duration.
   timeout-coefficient: 10
+  # Some internal/codegen mutants recurse or loop forever and keep taking
+  # memory until they time out; one worker per CPU (the default) can run out
+  # of memory on a 16 GB machine. Override with --workers if you have more.
+  workers: 2
   threshold:
     # KILLED / (KILLED + LIVED). Was 97.3% when introduced; the LIVED rest
     # are equivalent mutants (e.g. sort comparators over unique keys).

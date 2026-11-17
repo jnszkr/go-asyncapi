@@ -93,6 +93,33 @@ operations:
 	}
 }
 
+func TestParamsWithoutEnumHaveNoAllowedValues(t *testing.T) {
+	out, err := generate(t, `
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  orders:
+    address: orders.{region}
+    parameters: {region: {default: eu}}
+    messages:
+      order:
+        payload: {type: string}
+operations:
+  sendOrder:
+    action: send
+    channel: {$ref: '#/channels/orders'}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"region": "eu"`) {
+		t.Errorf("generated code does not contain the region default:\n%s", out)
+	}
+	if strings.Contains(out, "Allowed:") {
+		t.Errorf("generated code restricts parameter values although none has an enum:\n%s", out)
+	}
+}
+
 // typecheck fails the test if src does not compile on its own, e.g. because
 // of an unused import.
 func typecheck(t *testing.T, src string) {
@@ -313,6 +340,28 @@ channels:
   c:
     address: user-{id}.x
     parameters: {id: {}}
+    messages: {m: {payload: {type: string}}}
+operations:
+  o: {action: send, channel: {$ref: '#/channels/c'}}
+`, "whole subject token"},
+		"parameter ending inside a token": {`
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  c:
+    address: '{id}-user.x'
+    parameters: {id: {}}
+    messages: {m: {payload: {type: string}}}
+operations:
+  o: {action: send, channel: {$ref: '#/channels/c'}}
+`, "whole subject token"},
+		"two parameters in a token": {`
+asyncapi: 3.0.0
+info: {title: t, version: "1"}
+channels:
+  c:
+    address: '{a}{b}.x'
+    parameters: {a: {}, b: {}}
     messages: {m: {payload: {type: string}}}
 operations:
   o: {action: send, channel: {$ref: '#/channels/c'}}
