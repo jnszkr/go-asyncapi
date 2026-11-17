@@ -408,12 +408,39 @@ Pre-1.0: usable and tested, but the API may still change between minor versions.
 limitations are one message type per channel, untyped `oneOf`/`anyOf` and local `$ref`s only.
 See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
+## Benchmarks
+
+The generated code adds little on top of the transport: each method encodes the payload,
+builds the subject and hands the message on. Measured on an Apple M1 with Go 1.27, with a
+`struct{ Text string }` payload and JSON:
+
+| Benchmark | Time | Allocations |
+|---|---|---|
+| Publish, then receive and decode, in memory (`membroker`) | ~2.1 µs | 16 |
+| … with JSON Schema validation on both sides | ~6.1 µs | 60 |
+| Request and reply, in memory | ~6.1 µs | 43 |
+| Publish, then receive, over NATS on loopback | ~3.7 µs | 19 |
+| Request and reply over NATS on loopback (one in flight) | ~120 µs | 56 |
+| Generate the [orders example](examples/orders) from a parsed spec | ~1.3 ms | 13,744 |
+
+Times vary by machine. Run them yourself:
+
+```sh
+go test -run '^$' -bench . -benchmem ./...
+```
+
+The benchmarks live in `bench_test.go` in `broker`, `broker/natsbroker`, `internal/spec`
+and `internal/codegen`. To compare a change, run them with `-count 10` before and after,
+and compare the two outputs with
+[benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat).
+
 ## Development
 
 ```sh
 go test ./...                        # broker, golden and integration tests (embedded nats-server)
 go test ./internal/codegen -update   # refresh golden files after template changes
 golangci-lint run                    # lint (v2, same checks as CI; config in .golangci.yml)
+go test -run '^$' -bench . ./...     # benchmarks (see Benchmarks above)
 ```
 
 ## Contributing

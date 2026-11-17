@@ -36,23 +36,33 @@ func (c Channel[T]) WithReplySchema(schema string) Channel[T] {
 
 // Subject returns the concrete subject for p.
 func (c Channel[T]) Subject(p Params) (string, error) {
-	tokens := strings.Split(c.Address, ".")
-	for i, tok := range tokens {
-		name, ok := paramName(tok)
-		if !ok {
-			continue
-		}
-		v := p[name]
-		if v == "" {
-			v = c.Defaults[name]
-		}
-		v, err := c.value(name, v)
-		if err != nil {
-			return "", err
-		}
-		tokens[i] = v
+	if !strings.Contains(c.Address, "{") {
+		return c.Address, nil
 	}
-	return strings.Join(tokens, "."), nil
+	var sb strings.Builder
+	sb.Grow(len(c.Address))
+	for i, rest := 0, c.Address; ; i++ {
+		tok, after, more := strings.Cut(rest, ".")
+		if i > 0 {
+			sb.WriteByte('.')
+		}
+		if name, ok := paramName(tok); ok {
+			v := p[name]
+			if v == "" {
+				v = c.Defaults[name]
+			}
+			v, err := c.value(name, v)
+			if err != nil {
+				return "", err
+			}
+			tok = v
+		}
+		sb.WriteString(tok)
+		if !more {
+			return sb.String(), nil
+		}
+		rest = after
+	}
 }
 
 // Pattern returns the address with every parameter replaced by "*".
@@ -68,20 +78,23 @@ func (c Channel[T]) Pattern() string {
 
 // ParseSubject extracts the parameters from a concrete subject.
 func (c Channel[T]) ParseSubject(subject string) (Params, error) {
-	want := strings.Split(c.Address, ".")
-	got := strings.Split(subject, ".")
-	if len(want) != len(got) {
-		return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
-	}
 	p := Params{}
-	for i, tok := range want {
-		if name, ok := paramName(tok); ok {
-			p[name] = got[i]
-		} else if tok != got[i] {
+	for want, got := c.Address, subject; ; {
+		w, wrest, wmore := strings.Cut(want, ".")
+		g, grest, gmore := strings.Cut(got, ".")
+		if name, ok := paramName(w); ok {
+			p[name] = g
+		} else if w != g {
 			return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
 		}
+		if wmore != gmore {
+			return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
+		}
+		if !wmore {
+			return p, nil
+		}
+		want, got = wrest, grest
 	}
-	return p, nil
 }
 
 func (c Channel[T]) value(name, v string) (string, error) {
