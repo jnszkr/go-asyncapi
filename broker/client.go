@@ -76,6 +76,10 @@ type Client struct {
 	onError        func(error)
 	requestTimeout time.Duration
 	validator      Validator
+	// validates is whether payloads are checked: there is a validator and the
+	// codec produces JSON. Computed once, as parsing the content type is not
+	// free.
+	validates bool
 
 	publishInterceptors []PublishInterceptor
 	requestInterceptors []RequestInterceptor
@@ -141,6 +145,7 @@ func newClient(transport any, opts []Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.validates = c.validator != nil && isJSON(c.codec.ContentType())
 	if c.pub != nil {
 		c.pub = chain(PublishFunc(c.pub.Publish), c.publishInterceptors)
 	}
@@ -232,7 +237,7 @@ func Publish[T any](ctx context.Context, c *Client, ch Channel[T], p Params, msg
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m, err := c.encode(ch, ch.Schema, p, msg, opts)
+	m, err := encode(c, ch, p, msg, opts)
 	if err != nil {
 		return err
 	}
@@ -245,7 +250,7 @@ func Request[Req, Resp any](ctx context.Context, c *Client, ch Channel[Req], p P
 	if c.req == nil {
 		return resp, c.unsupported("request")
 	}
-	m, err := c.encode(ch, ch.Schema, p, req, opts)
+	m, err := encode(c, ch, p, req, opts)
 	if err != nil {
 		return resp, err
 	}
@@ -330,7 +335,9 @@ func Respond[Req, Resp any](c *Client, ch Channel[Req], h Responder[Req, Resp], 
 	})
 }
 
-func (c *Client) encode(ch channelSubject, schema string, p Params, payload any, opts []MsgOption) (*Message, error) {
+// encode is generic so that ch is not boxed into an interface, which would
+// allocate on every message.
+func encode[T any](c *Client, ch Channel[T], p Params, payload T, opts []MsgOption) (*Message, error) {
 	subject, err := ch.Subject(p)
 	if err != nil {
 		return nil, err
@@ -339,7 +346,7 @@ func (c *Client) encode(ch channelSubject, schema string, p Params, payload any,
 	if err != nil {
 		return nil, fmt.Errorf("encode %s: %w", subject, err)
 	}
-	if err := c.validate(schema, data); err != nil {
+	if err := c.validate(ch.Schema, data); err != nil {
 		return nil, fmt.Errorf("encode %s: %w", subject, err)
 	}
 	m := &Message{Subject: subject, Header: Header{}, Data: data}
@@ -348,11 +355,6 @@ func (c *Client) encode(ch channelSubject, schema string, p Params, payload any,
 		opt(m)
 	}
 	return m, nil
-}
-
-// channelSubject lets encode accept a Channel of any payload type.
-type channelSubject interface {
-	Subject(Params) (string, error)
 }
 
 func decode[T any](c *Client, ch Channel[T], m *Message) (Received[T], error) {
@@ -373,7 +375,7 @@ func decode[T any](c *Client, ch Channel[T], m *Message) (Received[T], error) {
 // checker returns the function checking payloads against schema, or nil when
 // they are not checked.
 func (c *Client) checker(schema string) (func([]byte) error, error) {
-	if c.validator == nil || schema == "" || !isJSON(c.codec.ContentType()) {
+	if !c.validates || schema == "" {
 		return nil, nil
 	}
 	if check, ok := c.compiled.Load(schema); ok {

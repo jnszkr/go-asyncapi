@@ -51,16 +51,20 @@ type typeSet struct {
 	imports map[string]bool
 	onWarn  func(string)
 	warned  map[string]bool
+	// declaring holds the schemas declare is working on, so that a schema
+	// leading back to itself is an error instead of endless recursion.
+	declaring map[*spec.Schema]bool
 }
 
 func newTypeSet(doc *spec.Document, onWarn func(string)) *typeSet {
 	return &typeSet{
-		doc:     doc,
-		byName:  map[string]*typeDecl{},
-		byRef:   map[string]string{},
-		imports: map[string]bool{},
-		onWarn:  onWarn,
-		warned:  map[string]bool{},
+		doc:       doc,
+		byName:    map[string]*typeDecl{},
+		byRef:     map[string]string{},
+		imports:   map[string]bool{},
+		onWarn:    onWarn,
+		warned:    map[string]bool{},
+		declaring: map[*spec.Schema]bool{},
 	}
 }
 
@@ -253,6 +257,14 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 		}
 		s = merged
 	}
+	// Recursive component schemas end at the byRef cache in goType, and inline
+	// schemas are new values, so reaching s again means a bug that would
+	// otherwise recurse until memory runs out.
+	if ts.declaring[s] {
+		return fmt.Errorf("%s: schema refers to itself", name)
+	}
+	ts.declaring[s] = true
+	defer delete(ts.declaring, s)
 	ts.warnIgnored(s, name)
 	d := &typeDecl{Name: name, Doc: schemaDoc(s)}
 	// Reserve the name before descending into properties.

@@ -27,7 +27,7 @@ var (
 	measure   = broker.Channel[greeting]{Address: "measure"}
 )
 
-func setup(t *testing.T) *natsbroker.Broker {
+func setup(t testing.TB) *natsbroker.Broker {
 	t.Helper()
 	opts := natstest.DefaultTestOptions
 	opts.Port = -1

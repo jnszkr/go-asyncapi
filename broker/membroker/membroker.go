@@ -135,16 +135,17 @@ func (b *Broker) targets(subject string) []*sub {
 }
 
 func match(pattern, subject string) bool {
-	p, s := strings.Split(pattern, "."), strings.Split(subject, ".")
-	if len(p) != len(s) {
-		return false
-	}
-	for i := range p {
-		if p[i] != "*" && p[i] != s[i] {
+	for {
+		p, prest, pmore := strings.Cut(pattern, ".")
+		s, srest, smore := strings.Cut(subject, ".")
+		if p != "*" && p != s || pmore != smore {
 			return false
 		}
+		if !pmore {
+			return true
+		}
+		pattern, subject = prest, srest
 	}
-	return true
 }
 
 func clone(m *broker.Message) *broker.Message {
