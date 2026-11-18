@@ -64,7 +64,7 @@ operations:
   pubA: {action: send, channel: {$ref: '#/channels/a'}}
   pubB: {action: send, channel: {$ref: '#/channels/b'}}
 `)
-	contains(t, out, "broker.Channel[Created]", "broker.Channel[BCreated]", "X string", "Y int64")
+	contains(t, out, "Channel[Created]", "Channel[BCreated]", "X string", "Y int64")
 }
 
 func TestSameMessageNameOnTwoComponents(t *testing.T) {
@@ -95,7 +95,7 @@ components:
   messages:
     Event: {payload: {type: string}}
 `)
-	contains(t, out, "AChannel = broker.Channel[Event]", "BChannel = broker.Channel[Event]")
+	contains(t, out, "AChannel = Channel[Event]", "BChannel = Channel[Event]")
 	if strings.Contains(out, "Event2") || strings.Contains(out, "BEvent") {
 		t.Errorf("shared message was duplicated:\n%s", out)
 	}
@@ -139,7 +139,7 @@ components:
 `)
 	contains(t, out,
 		"type Inline struct", "ID string", `InlineHeaderTrace = "trace"`,
-		"broker.Channel[Named]",
+		"Channel[Named]",
 		"type Wrapped struct", "W string",
 	)
 }
@@ -191,7 +191,7 @@ components:
   messageTraits:
     traced: {headers: {type: object, properties: {trace: {type: string}}}}
 `)
-	contains(t, out, `MHeaderTrace = "trace"`, `broker.Queue("workers")`)
+	contains(t, out, `MHeaderTrace = "trace"`, `Queue: "workers"`)
 }
 
 func TestAllOf(t *testing.T) {
@@ -232,7 +232,7 @@ components:
 	contains(t, out,
 		"// A dog.\ntype Dog struct", "Bark *bool", "Name string",
 		"type Inline struct", "Own  *int64", "Tag  string",
-		"RChannel = broker.Channel[Pet]",
+		"RChannel = Channel[Pet]",
 	)
 	if strings.Contains(out, "RawMessage") {
 		t.Errorf("allOf should not fall back to json.RawMessage:\n%s", out)
@@ -292,10 +292,10 @@ func TestConstIsTypedAndDocumented(t *testing.T) {
 
 func TestIgnoredKeywordsWarn(t *testing.T) {
 	tests := map[string]struct{ payload, want string }{
-		"not":                  {`{type: object, properties: {k: {not: {type: integer}}}}`, "not is only enforced with broker.WithValidator"},
-		"if":                   {`{type: object, properties: {k: {if: {type: integer}}}}`, "if is only enforced with broker.WithValidator"},
-		"root":                 {`{type: object, not: {required: [a]}, properties: {a: {type: string}}}`, "not is only enforced with broker.WithValidator"},
-		"additionalProperties": {`{type: object, properties: {a: {type: string}}, additionalProperties: {type: integer}}`, "additionalProperties next to properties is only enforced"},
+		"not":                  {`{type: object, properties: {k: {not: {type: integer}}}}`, "not is not enforced"},
+		"if":                   {`{type: object, properties: {k: {if: {type: integer}}}}`, "if is not enforced"},
+		"root":                 {`{type: object, not: {required: [a]}, properties: {a: {type: string}}}`, "not is not enforced"},
+		"additionalProperties": {`{type: object, properties: {a: {type: string}}, additionalProperties: {type: integer}}`, "additionalProperties next to properties is not enforced"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -310,6 +310,8 @@ func TestSupportedDocumentsDoNotWarn(t *testing.T) {
 		`{type: object, properties: {a: {type: string}}, additionalProperties: true}`,
 		`{type: object, properties: {a: {type: string}}, additionalProperties: false}`,
 		`{type: object, additionalProperties: {type: integer}}`,
+		`{type: object, additionalProperties: {}}`,
+		`{type: object, properties: {a: {}}, additionalProperties: {}}`,
 	} {
 		if _, warnings := compile(t, payloadDoc(payload)); len(warnings) != 0 {
 			t.Errorf("%s: unexpected warnings: %q", payload, warnings)
@@ -332,7 +334,7 @@ operations:
 		}
 	}
 	_, warnings := compile(t, doc("application/avro"))
-	warned(t, warnings, "WithCodec")
+	warned(t, warnings, "payloads are encoded as JSON")
 }
 
 func TestServersMustIncludeNATS(t *testing.T) {
@@ -471,5 +473,20 @@ operations:
 				t.Fatalf("got error %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestMessageWithoutPayload checks that a message without a payload carries
+// any value.
+func TestMessageWithoutPayload(t *testing.T) {
+	out, warnings := compile(t, head+`
+channels:
+  c: {address: a, messages: {m: {name: Ping}}}
+operations:
+  pub: {action: send, channel: {$ref: '#/channels/c'}}
+`)
+	contains(t, out, "type Ping = any", "Channel[Ping]")
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", warnings)
 	}
 }

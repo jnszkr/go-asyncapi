@@ -83,9 +83,10 @@ operations:
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`PingChannel = broker.Channel[Ping]{`,
+		`PingChannel = Channel[Ping]{`,
 		`type Ping = string`,
-		`return broker.Subscribe(c.Client, PingChannel, h, opts...)`,
+		`return c.t.Subscribe(OnPingEndpoint.Subject, OnPingEndpoint.Queue,`,
+		`OnPingEndpoint = Endpoint{Subject: "ping"}`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("generated code does not contain %q:\n%s", want, out)
@@ -185,10 +186,11 @@ operations:
 
 func TestParts(t *testing.T) {
 	models := []string{"type Event struct", `EventHeaderTrace = "trace"`, `"time"`, "type Tick = string", "type Lookup = string", "type Answer = string"}
-	producer := []string{"type Producer struct", "func NewProducer(", "func (c *Producer) SendEvent(", "EventsChannel", "EventsParams"}
-	consumer := []string{"type Consumer struct", "func NewConsumer(", "func (c *Consumer) OnTick(", "TicksChannel", "OnTickEndpoint"}
-	client := []string{"type Client struct", "func NewClient(", "func (c *Client) GetLookup(", "LookupsChannel"}
-	server := []string{"type Server struct", "func NewServer(", "func (c *Server) ServeLookup(", "LookupsChannel", "ServeLookupEndpoint"}
+	producer := []string{"type Producer struct", "func NewProducer(", "func (c *Producer) SendEvent(", "EventsChannel", "EventsParams", "type Publisher interface"}
+	consumer := []string{"type Consumer struct", "func NewConsumer(", "func (c *Consumer) OnTick(", "TicksChannel", "OnTickEndpoint", "type Subscriber interface", "type Settlement = int", "func Terminate(", "func settle(", `"errors"`}
+	client := []string{"type Client struct", "func NewClient(", "func (c *Client) GetLookup(", "LookupsChannel", "type Requester interface"}
+	server := []string{"type Server struct", "func NewServer(", "func (c *Server) ServeLookup(", "LookupsChannel", "ServeLookupEndpoint", "type Replier interface"}
+	receive := []string{"type Inbox = interface", "type Subscription = interface", "type Received[T any]", "func decode[", "ParseSubject"}
 
 	tests := map[string]struct {
 		parts   []Part
@@ -198,13 +200,13 @@ func TestParts(t *testing.T) {
 	}{
 		"default":  {nil, [][]string{producer, consumer, client, server}, nil, true},
 		"all":      {allParts, [][]string{producer, consumer, client, server}, nil, true},
-		"models":   {[]Part{PartModels}, nil, [][]string{producer, consumer, client, server, {"broker"}}, false},
-		"producer": {[]Part{PartProducer}, [][]string{producer}, [][]string{consumer, client, server}, true},
-		"consumer": {[]Part{PartConsumer}, [][]string{consumer}, [][]string{producer, client, server}, false},
-		"client":   {[]Part{PartClient}, [][]string{client}, [][]string{producer, consumer, {"type Server struct", "ServeLookupEndpoint"}}, true},
-		"server":   {[]Part{PartServer}, [][]string{server}, [][]string{producer, consumer, {"type Client struct"}}, false},
+		"models":   {[]Part{PartModels}, nil, [][]string{producer, consumer, client, server, receive, {"type Params", "Channel[", "broker"}}, false},
+		"producer": {[]Part{PartProducer}, [][]string{producer}, [][]string{consumer, client, server, receive}, true},
+		"consumer": {[]Part{PartConsumer}, [][]string{consumer, receive}, [][]string{producer, client, server}, true},
+		"client":   {[]Part{PartClient}, [][]string{client}, [][]string{producer, consumer, receive, {"type Server struct", "ServeLookupEndpoint", "type Replier"}}, true},
+		"server":   {[]Part{PartServer}, [][]string{server, receive}, [][]string{producer, consumer, {"type Client struct"}}, true},
 		"consumer and client": {
-			[]Part{PartClient, PartConsumer}, [][]string{consumer, client}, [][]string{producer, {"type Server struct"}}, true,
+			[]Part{PartClient, PartConsumer}, [][]string{consumer, client, receive}, [][]string{producer, {"type Server struct"}}, true,
 		},
 	}
 	for name, tc := range tests {
@@ -484,8 +486,8 @@ components:
 		"Target  *url.URL",
 		"Name    *string",
 		`"net/url"`,
-		"broker.Channel[Addr]",
-		"broker.Channel[Event]",
+		"Channel[Addr]",
+		"Channel[Event]",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q:\n%s", want, out)
@@ -564,17 +566,42 @@ operations:
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`func NewProducer(b broker.Publisher, opts ...broker.Option) *Producer {`,
-		`return &Producer{Client: broker.ForPublisher(b, opts...)}`,
-		`func NewConsumer(b broker.Subscriber, opts ...broker.Option) *Consumer {`,
-		`return &Consumer{Client: broker.ForSubscriber(b, opts...)}`,
-		`func NewClient(b broker.Requester, opts ...broker.Option) *Client {`,
-		`return &Client{Client: broker.ForRequester(b, opts...)}`,
-		`func NewServer(b broker.PubSub, opts ...broker.Option) *Server {`,
-		`return &Server{Client: broker.ForPubSub(b, opts...)}`,
+		`func NewProducer(t Publisher) *Producer { return &Producer{t: t} }`,
+		`func NewConsumer(t Subscriber) *Consumer { return &Consumer{t: t} }`,
+		`func NewClient(t Requester) *Client { return &Client{t: t} }`,
+		`func NewServer(t Replier) *Server { return &Server{t: t} }`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("generated code does not contain %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRuntimeNameClash checks that a document type taking a name the
+// generated messaging code declares is an error, but only for the parts that
+// declare it.
+func TestRuntimeNameClash(t *testing.T) {
+	names := map[Part][]string{
+		PartProducer: {"Params", "Channel", "Publisher"},
+		PartConsumer: {"Params", "Channel", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Subscriber", "Settlement", "Ack", "Nak", "Term", "Terminate"},
+		PartClient:   {"Params", "Channel", "Requester"},
+		PartServer:   {"Params", "Channel", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Replier"},
+	}
+	all := []string{"Params", "Channel", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Publisher", "Subscriber", "Settlement", "Ack", "Nak", "Term", "Terminate", "Requester", "Replier"}
+	for part, taken := range names {
+		for _, name := range all {
+			doc, err := spec.Parse([]byte(allOperations + "components:\n  schemas:\n    " + name + ": {type: string}\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = Generate(doc, Options{Package: "p", Parts: []Part{part}})
+			want := slices.Contains(taken, name)
+			if got := err != nil && strings.Contains(err.Error(), "clashes with the generated "+name); got != want {
+				t.Errorf("%s with a type %s: err = %v, want a clash: %v", part, name, err, want)
+			}
+			if _, err := Generate(doc, Options{Package: "p", Parts: []Part{PartModels}}); err != nil {
+				t.Errorf("models with a type %s: %v", name, err)
+			}
 		}
 	}
 }

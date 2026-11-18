@@ -9,17 +9,13 @@ import (
 
 	"github.com/jnszkr/go-asyncapi/broker"
 	"github.com/jnszkr/go-asyncapi/broker/jsbroker"
-	"github.com/jnszkr/go-asyncapi/broker/membroker"
+	"github.com/jnszkr/go-asyncapi/broker/natsbroker"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-type event struct {
-	N int `json:"n"`
-}
-
-var events = broker.Channel[event]{Address: "events.{kind}"}
+const filter = "events.*"
 
 func setup(t *testing.T) jetstream.JetStream {
 	t.Helper()
@@ -38,8 +34,7 @@ func setup(t *testing.T) jetstream.JetStream {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: "EVENTS", Subjects: []string{"events.>"}}); err != nil {
+	if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{Name: "EVENTS", Subjects: []string{"events.>"}}); err != nil {
 		t.Fatal(err)
 	}
 	return js
@@ -47,12 +42,15 @@ func setup(t *testing.T) jetstream.JetStream {
 
 func consumer(t *testing.T, js jetstream.JetStream, cfg jetstream.ConsumerConfig) jetstream.Consumer {
 	t.Helper()
+	cfg.AckPolicy = jetstream.AckExplicitPolicy
 	cons, err := js.CreateOrUpdateConsumer(context.Background(), "EVENTS", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return cons
 }
+
+func ack(context.Context, broker.Inbox) (broker.Settlement, error) { return broker.Ack, nil }
 
 // recording is a consumer that records the options given to Consume.
 type recording struct {
@@ -69,47 +67,34 @@ func (r *recording) Consume(h jetstream.MessageHandler, opts ...jetstream.PullCo
 // options reach Consume with none added by the Broker.
 func TestFactory(t *testing.T) {
 	js := setup(t)
-	cons := &recording{Consumer: consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy})}
-	var got broker.SubConfig
-	f := jsbroker.ConsumerFunc(func(cfg broker.SubConfig) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
-		got = cfg
+	cons := &recording{Consumer: consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter})}
+	var gotFilter, gotQueue string
+	f := jsbroker.ConsumerFunc(func(filter, queue string) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
+		gotFilter, gotQueue = filter, queue
 		return cons, []jetstream.PullConsumeOpt{jetstream.PullMaxMessages(10)}, nil
 	})
-	c := broker.New(jsbroker.New(js))
-	h := func(context.Context, broker.Received[event]) error { return nil }
-	sub, err := broker.Subscribe(c, events, h, jsbroker.FromFactory(f), broker.Queue("workers"))
+	b := jsbroker.New(js, jsbroker.WithConsumers(f))
+	if b.JetStream() != js {
+		t.Error("JetStream is not the context given")
+	}
+	sub, err := b.Subscribe(filter, "workers", ack)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sub.Unsubscribe()
-	if got.Subject != events.Pattern() || got.Queue != "workers" {
-		t.Errorf("factory got %+v", got)
+	if gotFilter != filter || gotQueue != "workers" {
+		t.Errorf("factory got %q, %q", gotFilter, gotQueue)
 	}
 	if len(cons.opts) != 1 {
 		t.Errorf("Consume got %d options, want the factory's 1", len(cons.opts))
 	}
 }
 
-func TestFactoryErrorFails(t *testing.T) {
-	boom := errors.New("boom")
-	f := jsbroker.ConsumerFunc(func(broker.SubConfig) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
-		return nil, nil, boom
-	})
-	c := broker.New(jsbroker.New(setup(t)))
-	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil }, jsbroker.FromFactory(f))
-	if !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want boom", err)
-	}
-}
-
-// TestFromPassesOptions checks that options given with an existing consumer
-// reach Consume.
-func TestFromPassesOptions(t *testing.T) {
+func TestExistingPassesOptions(t *testing.T) {
 	js := setup(t)
-	cons := &recording{Consumer: consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy})}
-	c := broker.New(jsbroker.New(js))
-	h := func(context.Context, broker.Received[event]) error { return nil }
-	sub, err := broker.Subscribe(c, events, h, jsbroker.From(cons, jetstream.PullMaxMessages(10)))
+	cons := &recording{Consumer: consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter})}
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons, jetstream.PullMaxMessages(10))))
+	sub, err := b.Subscribe(filter, "", ack)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,8 +104,77 @@ func TestFromPassesOptions(t *testing.T) {
 	}
 }
 
-// settled waits until the consumer has nothing pending or waiting for an ack.
-func settled(t *testing.T, cons jetstream.Consumer) {
+func TestFactoryErrorFails(t *testing.T) {
+	boom := errors.New("boom")
+	f := jsbroker.ConsumerFunc(func(string, string) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
+		return nil, nil, boom
+	})
+	_, err := jsbroker.New(setup(t), jsbroker.WithConsumers(f)).Subscribe(filter, "", ack)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want boom", err)
+	}
+}
+
+func TestSubscribeWithoutConsumerFails(t *testing.T) {
+	_, err := jsbroker.New(setup(t)).Subscribe(filter, "", ack)
+	if !errors.Is(err, jsbroker.ErrNoConsumer) {
+		t.Fatalf("err = %v, want ErrNoConsumer", err)
+	}
+}
+
+// failingConsume is a consumer whose Consume fails.
+type failingConsume struct{ jetstream.Consumer }
+
+func (failingConsume) Consume(jetstream.MessageHandler, ...jetstream.PullConsumeOpt) (jetstream.ConsumeContext, error) {
+	return nil, errors.New("consume failed")
+}
+
+func (failingConsume) CachedInfo() *jetstream.ConsumerInfo { return nil }
+
+func TestConsumeErrorFails(t *testing.T) {
+	b := jsbroker.New(setup(t), jsbroker.WithConsumers(jsbroker.Existing(failingConsume{})))
+	if _, err := b.Subscribe(filter, "", ack); err == nil || err.Error() != "consume failed" {
+		t.Fatalf("err = %v, want the Consume error", err)
+	}
+}
+
+// TestFilterOutsideSubjectFails checks that a consumer delivering subjects
+// the subscription cannot parse is rejected instead of terminating them.
+func TestFilterOutsideSubjectFails(t *testing.T) {
+	js := setup(t)
+	for _, f := range []string{"events.>", "other.*", "events.a.b", "events"} {
+		cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: f})
+		if _, err := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons))).Subscribe(filter, "", ack); err == nil {
+			t.Errorf("filter %q: expected an error", f)
+		}
+	}
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubjects: []string{"events.a", "other.b"}})
+	if _, err := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons))).Subscribe(filter, "", ack); err == nil {
+		t.Error("filters with one outside: expected an error")
+	}
+	for _, cfg := range []jetstream.ConsumerConfig{
+		{},
+		{FilterSubject: "events.*"},
+		{FilterSubject: "events.a"},
+		{FilterSubjects: []string{"events.a", "events.b"}},
+	} {
+		cons := consumer(t, js, cfg)
+		sub, err := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons))).Subscribe(filter, "", ack)
+		if err != nil {
+			t.Errorf("%+v: %v", cfg, err)
+			continue
+		}
+		sub.Unsubscribe()
+	}
+	// A literal token in the subscription needs the same token in the filter.
+	cons = consumer(t, js, jetstream.ConsumerConfig{FilterSubject: "events.a"})
+	if _, err := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons))).Subscribe("events.b", "", ack); err == nil {
+		t.Error("filter events.a on events.b: expected an error")
+	}
+}
+
+// pending waits until the consumer has nothing pending or waiting for an ack.
+func pending(t *testing.T, cons jetstream.Consumer) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -138,8 +192,116 @@ func settled(t *testing.T, cons jetstream.Consumer) {
 	}
 }
 
+// TestSettlements checks that Nak and unknown settlements redeliver, and that
+// Ack and Term do not.
+func TestSettlements(t *testing.T) {
+	js := setup(t)
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckWait: time.Second})
+	var errs atomic.Int32
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons)), jsbroker.WithErrorHandler(func(error) { errs.Add(1) }))
+
+	attempts := map[string]*atomic.Int32{}
+	for _, s := range []string{"events.ack", "events.term", "events.nak", "events.zero"} {
+		attempts[s] = &atomic.Int32{}
+	}
+	sub, err := b.Subscribe(filter, "", func(_ context.Context, m broker.Inbox) (broker.Settlement, error) {
+		n := attempts[m.Subject()].Add(1)
+		switch {
+		case m.Subject() == "events.ack":
+			return broker.Ack, nil
+		case m.Subject() == "events.term":
+			return broker.Term, errors.New("never")
+		case n > 1:
+			return broker.Ack, nil
+		case m.Subject() == "events.nak":
+			return broker.Nak, errors.New("later")
+		default:
+			return 0, nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	ctx := context.Background()
+	for s := range attempts {
+		if err := b.Publish(ctx, s, nil, []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending(t, cons)
+	time.Sleep(1500 * time.Millisecond) // past AckWait: anything unsettled is redelivered
+	pending(t, cons)
+	for s, want := range map[string]int32{"events.ack": 1, "events.term": 1, "events.nak": 2, "events.zero": 2} {
+		if n := attempts[s].Load(); n != want {
+			t.Errorf("%s: %d deliveries, want %d", s, n, want)
+		}
+	}
+	if n := errs.Load(); n != 2 {
+		t.Errorf("reported %d errors, want 2", n)
+	}
+}
+
+func TestInboxCarriesTheMessage(t *testing.T) {
+	js := setup(t)
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter})
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons)))
+	type delivery struct {
+		subject string
+		headers map[string][]string
+		data    string
+	}
+	got := make(chan delivery, 2)
+	sub, err := b.Subscribe(filter, "", func(_ context.Context, m broker.Inbox) (broker.Settlement, error) {
+		got <- delivery{m.Subject(), m.Headers(), string(m.Data())}
+		return broker.Ack, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	ctx := context.Background()
+	if err := b.Publish(ctx, "events.a", map[string][]string{"K": {"v"}}, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if d := <-got; d.subject != "events.a" || d.data != "one" || d.headers["K"][0] != "v" {
+		t.Errorf("received %+v", d)
+	}
+	if err := b.Publish(ctx, "events.b", nil, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if d := <-got; d.headers == nil {
+		t.Errorf("headers of a message without any are nil")
+	}
+}
+
+func TestUnsubscribeStopsConsuming(t *testing.T) {
+	js := setup(t)
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter})
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons)))
+	var n atomic.Int32
+	sub, err := b.Subscribe(filter, "", func(context.Context, broker.Inbox) (broker.Settlement, error) {
+		n.Add(1)
+		return broker.Ack, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Publish(context.Background(), "events.a", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n.Load() != 0 {
+		t.Error("message delivered after Unsubscribe")
+	}
+}
+
 // TestInterceptorDeadLetters moves a message that keeps failing to another
-// stream, and one that cannot be decoded straight away.
+// stream, and one that can never be handled straight away.
 func TestInterceptorDeadLetters(t *testing.T) {
 	js := setup(t)
 	ctx := context.Background()
@@ -147,42 +309,46 @@ func TestInterceptorDeadLetters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy, AckWait: time.Second})
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckWait: time.Second})
 	deadLetter := func(next jsbroker.Deliver) jsbroker.Deliver {
-		return func(ctx context.Context, msg jetstream.Msg) error {
-			err := next(ctx, msg)
-			if err == nil {
-				return nil
+		return func(ctx context.Context, msg jetstream.Msg) (broker.Settlement, error) {
+			s, err := next(ctx, msg)
+			if s == broker.Ack {
+				return s, err
 			}
 			md, merr := msg.Metadata()
 			if merr != nil {
-				return merr
+				return broker.Nak, merr
 			}
-			if md.NumDelivered < 2 && !errors.Is(err, broker.ErrMalformed) {
-				return err
+			if md.NumDelivered < 2 && s != broker.Term {
+				return s, err
 			}
 			_, perr := js.Publish(ctx, "dlq."+msg.Subject(), msg.Data())
-			return perr
+			return broker.Ack, perr
 		}
 	}
 	var attempts atomic.Int32
-	c := broker.New(jsbroker.New(js))
-	sub, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error {
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons)), jsbroker.WithInterceptors(deadLetter))
+	sub, err := b.Subscribe(filter, "", func(_ context.Context, m broker.Inbox) (broker.Settlement, error) {
+		if m.Subject() == "events.bad" {
+			return broker.Term, errors.New("malformed")
+		}
 		attempts.Add(1)
-		return errors.New("always fails")
-	}, jsbroker.FromFactory(jsbroker.Existing(cons), deadLetter))
+		return broker.Nak, errors.New("always fails")
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sub.Unsubscribe()
 
-	if _, err := js.Publish(ctx, "events.bad", []byte("{")); err != nil {
-		t.Fatal(err)
+	for _, s := range []string{"events.bad", "events.good"} {
+		if err := b.Publish(ctx, s, nil, []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := broker.Publish(ctx, c, events, broker.Params{"kind": "good"}, event{N: 7}); err != nil {
-		t.Fatal(err)
-	}
-	settled(t, cons)
+	pending(t, cons)
+	time.Sleep(1500 * time.Millisecond)
+	pending(t, cons)
 	if n := attempts.Load(); n != 2 {
 		t.Errorf("handler attempts = %d, want 2", n)
 	}
@@ -196,31 +362,31 @@ func TestInterceptorDeadLetters(t *testing.T) {
 }
 
 // TestInterceptorSettles checks that a message an Interceptor terminated is
-// not redelivered, even though the delivery returns an error.
+// not redelivered, even though the delivery says Nak.
 func TestInterceptorSettles(t *testing.T) {
 	js := setup(t)
-	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy, AckWait: 200 * time.Millisecond})
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckWait: 200 * time.Millisecond})
 	termErrs := make(chan error, 8)
 	terminate := func(next jsbroker.Deliver) jsbroker.Deliver {
-		return func(ctx context.Context, msg jetstream.Msg) error {
-			err := next(ctx, msg)
+		return func(ctx context.Context, msg jetstream.Msg) (broker.Settlement, error) {
+			s, err := next(ctx, msg)
 			termErrs <- msg.Term()
-			return err
+			return s, err
 		}
 	}
-	c := broker.New(jsbroker.New(js))
-	sub, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error {
-		return errors.New("fails")
-	}, jsbroker.FromFactory(jsbroker.Existing(cons), terminate))
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons)), jsbroker.WithInterceptors(terminate))
+	sub, err := b.Subscribe(filter, "", func(context.Context, broker.Inbox) (broker.Settlement, error) {
+		return broker.Nak, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sub.Unsubscribe()
 
-	if err := broker.Publish(context.Background(), c, events, broker.Params{"kind": "a"}, event{}); err != nil {
+	if err := b.Publish(context.Background(), "events.a", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	settled(t, cons)
+	pending(t, cons)
 	time.Sleep(500 * time.Millisecond) // longer than AckWait: a nak would have redelivered
 	if n := len(termErrs); n != 1 {
 		t.Fatalf("deliveries = %d, want 1", n)
@@ -234,178 +400,90 @@ func TestInterceptorSettles(t *testing.T) {
 // outermost and that the context it passes on reaches the handler.
 func TestInterceptorOrderAndContext(t *testing.T) {
 	js := setup(t)
-	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy})
+	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter})
 	type key struct{}
 	with := func(name string) jsbroker.Interceptor {
 		return func(next jsbroker.Deliver) jsbroker.Deliver {
-			return func(ctx context.Context, msg jetstream.Msg) error {
+			return func(ctx context.Context, msg jetstream.Msg) (broker.Settlement, error) {
 				path, _ := ctx.Value(key{}).(string)
 				return next(context.WithValue(ctx, key{}, path+name), msg)
 			}
 		}
 	}
 	got := make(chan string, 1)
-	c := broker.New(jsbroker.New(js))
-	sub, err := broker.Subscribe(c, events, func(ctx context.Context, _ broker.Received[event]) error {
+	b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons)),
+		jsbroker.WithInterceptors(with("a")), jsbroker.WithInterceptors(with("b"), with("c")))
+	sub, err := b.Subscribe(filter, "", func(ctx context.Context, _ broker.Inbox) (broker.Settlement, error) {
 		got <- ctx.Value(key{}).(string)
-		return nil
-	}, jsbroker.FromFactory(jsbroker.Existing(cons), with("a"), with("b")))
+		return broker.Ack, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sub.Unsubscribe()
 
-	if err := broker.Publish(context.Background(), c, events, broker.Params{"kind": "a"}, event{}); err != nil {
+	if err := b.Publish(context.Background(), "events.a", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case path := <-got:
-		if path != "ab" {
-			t.Errorf("path = %q, want ab", path)
+		if path != "abc" {
+			t.Errorf("path = %q, want abc", path)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out")
 	}
 }
 
-// TestClientInterceptorDecidesAck checks that the error a transport-agnostic
-// interceptor returns settles the message.
-func TestClientInterceptorDecidesAck(t *testing.T) {
-	js := setup(t)
-	cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: events.Pattern(), AckPolicy: jetstream.AckExplicitPolicy, AckWait: 200 * time.Millisecond})
-	var attempts atomic.Int32
-	c := broker.New(jsbroker.New(js), broker.WithReceiveInterceptors(func(next broker.ReceiveFunc) broker.ReceiveFunc {
-		return func(ctx context.Context, m *broker.Message) error {
-			_ = next(ctx, m)
-			return nil
-		}
-	}))
-	sub, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error {
-		attempts.Add(1)
-		return errors.New("fails")
-	}, jsbroker.From(cons))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sub.Unsubscribe()
-
-	if err := broker.Publish(context.Background(), c, events, broker.Params{"kind": "a"}, event{}); err != nil {
-		t.Fatal(err)
-	}
-	settled(t, cons)
-	time.Sleep(500 * time.Millisecond) // longer than AckWait
-	if n := attempts.Load(); n != 1 {
-		t.Errorf("handler attempts = %d, want 1", n)
-	}
-}
-
-func TestSubscribeWithoutConsumerFails(t *testing.T) {
-	c := broker.New(jsbroker.New(setup(t)))
-	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil })
-	if !errors.Is(err, jsbroker.ErrNoConsumer) {
-		t.Fatalf("err = %v, want ErrNoConsumer", err)
-	}
-}
-
-// TestFilterOutsideSubjectFails checks that a consumer delivering subjects
-// the channel cannot parse is rejected instead of terminating them.
-func TestFilterOutsideSubjectFails(t *testing.T) {
-	js := setup(t)
-	c := broker.New(jsbroker.New(js))
-	h := func(context.Context, broker.Received[event]) error { return nil }
-	for _, filter := range []string{"events.>", "other.*", "events.a.b"} {
-		cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckPolicy: jetstream.AckExplicitPolicy})
-		if _, err := broker.Subscribe(c, events, h, jsbroker.From(cons)); err == nil {
-			t.Errorf("filter %q: expected an error", filter)
-		}
-	}
-	for _, filter := range []string{"", "events.*", "events.a"} {
-		cons := consumer(t, js, jetstream.ConsumerConfig{FilterSubject: filter, AckPolicy: jetstream.AckExplicitPolicy})
-		sub, err := broker.Subscribe(c, events, h, jsbroker.From(cons))
-		if err != nil {
-			t.Errorf("filter %q: %v", filter, err)
-			continue
-		}
-		sub.Unsubscribe()
-	}
-}
-
-func TestOtherBrokersRejectConsumers(t *testing.T) {
-	cons := consumer(t, setup(t), jetstream.ConsumerConfig{AckPolicy: jetstream.AckExplicitPolicy})
-	c := broker.New(membroker.New())
-	_, err := broker.Subscribe(c, events, func(context.Context, broker.Received[event]) error { return nil }, jsbroker.From(cons))
-	if err == nil {
-		t.Fatal("expected membroker to reject a JetStream consumer")
-	}
-}
-
-// TestAcks checks that a handler error redelivers the message and a
-// malformed message is terminated rather than retried.
-func TestAcks(t *testing.T) {
-	js := setup(t)
-	cons := consumer(t, js, jetstream.ConsumerConfig{
-		Durable:       "workers",
-		FilterSubject: events.Pattern(),
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       time.Second,
-	})
-	c := broker.New(jsbroker.New(js))
-
-	var attempts atomic.Int32
-	done := make(chan event, 1)
-	sub, err := broker.Subscribe(c, events, func(_ context.Context, m broker.Received[event]) error {
-		if attempts.Add(1) == 1 {
-			return errors.New("try again")
-		}
-		done <- m.Payload
-		return nil
-	}, jsbroker.From(cons))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sub.Unsubscribe()
-
-	ctx := context.Background()
-	// Not JSON: decoding fails with ErrMalformed, so it is never retried.
-	if _, err := js.Publish(ctx, "events.bad", []byte("{")); err != nil {
-		t.Fatal(err)
-	}
-	if err := broker.Publish(ctx, c, events, broker.Params{"kind": "good"}, event{N: 7}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case e := <-done:
-		if e.N != 7 {
-			t.Errorf("event = %+v", e)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for redelivery")
-	}
-	if n := attempts.Load(); n != 2 {
-		t.Errorf("handler attempts = %d, want 2 (one failure, one redelivery)", n)
-	}
-
-	// Everything is settled: nothing pending, nothing waiting for an ack.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		info, err := cons.Info(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.NumAckPending == 0 && info.NumPending == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("consumer not settled: %d ack pending, %d pending", info.NumAckPending, info.NumPending)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
 func TestPublishWithoutStreamFails(t *testing.T) {
-	c := broker.New(jsbroker.New(setup(t)))
-	nowhere := broker.Channel[event]{Address: "nowhere"}
-	if err := broker.Publish(context.Background(), c, nowhere, nil, event{}); err == nil {
+	if err := jsbroker.New(setup(t)).Publish(context.Background(), "nowhere", nil, nil); err == nil {
 		t.Fatal("expected an error publishing to a subject no stream captures")
+	}
+}
+
+// TestRequest sends requests over core NATS to a natsbroker responder.
+func TestRequest(t *testing.T) {
+	js := setup(t)
+	nc := js.Conn()
+	if _, err := natsbroker.New(nc).Reply("svc", "", func(_ context.Context, m broker.Inbox) ([]byte, error) {
+		if string(m.Data()) == "fail" {
+			return nil, errors.New("cannot")
+		}
+		return append([]byte("re:"), m.Data()...), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nc.Subscribe("slow", func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	b := jsbroker.New(js, jsbroker.WithRequestTimeout(50*time.Millisecond))
+	ctx := context.Background()
+	body, h, err := b.Request(ctx, "svc", map[string][]string{"K": {"v"}}, []byte("hi"))
+	if err != nil || string(body) != "re:hi" {
+		t.Fatalf("Request = %q, %v, %v", body, h, err)
+	}
+	body, _, err = b.Request(ctx, "svc", nil, []byte("fail"))
+	var remote *broker.RemoteError
+	if !errors.As(err, &remote) || remote.Code != broker.CodeInternal || body != nil {
+		t.Errorf("err = %v, body = %q, want RemoteError 500", err, body)
+	}
+	start := time.Now()
+	if _, _, err := b.Request(ctx, "slow", nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("took %v, want about the 50ms timeout", d)
+	}
+	deadline, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	start = time.Now()
+	if _, _, err := jsbroker.New(js, jsbroker.WithRequestTimeout(time.Hour)).Request(deadline, "slow", nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("took %v, want about the 20ms deadline", d)
 	}
 }

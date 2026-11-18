@@ -5,10 +5,187 @@ package orders
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"time"
-
-	"github.com/jnszkr/go-asyncapi/broker"
 )
+
+// Transport. Implement these interfaces to carry the messages, or use the
+// transports of github.com/jnszkr/go-asyncapi/broker. Inbox, Subscription
+// and Settlement are aliases of unnamed types, so an implementation in any
+// package satisfies the interfaces without importing this one.
+
+// Publisher is the transport of Producer.
+type Publisher interface {
+	Publish(ctx context.Context, subject string, headers map[string][]string, body []byte) error
+}
+
+// Subscriber is the transport of Consumer.
+type Subscriber interface {
+	// Subscribe calls h for every message matching filter, whose tokens may
+	// be "*". Subscribers sharing queue split the messages between them. The
+	// returned Settlement says what to do with the message; the error, if any,
+	// says why and is for the transport to report.
+	Subscribe(filter, queue string, h func(ctx context.Context, msg Inbox) (Settlement, error)) (Subscription, error)
+}
+
+// Requester is the transport of Client.
+type Requester interface {
+	// Request sends a request and waits for its reply; ctx carries the
+	// deadline. A reply reporting a failure is returned as err.
+	Request(ctx context.Context, subject string, headers map[string][]string, body []byte) (replyBody []byte, replyHeaders map[string][]string, err error)
+}
+
+// Replier is the transport of Server.
+type Replier interface {
+	// Reply calls h for every request matching subject and sends back what h
+	// returns. A non-nil err is sent to the requester as a failure instead:
+	// the requester's when it has a Malformed() bool method returning true,
+	// the responder's when not.
+	Reply(subject, queue string, h func(ctx context.Context, msg Inbox) (replyBody []byte, err error)) (Subscription, error)
+}
+
+// Inbox is a received message.
+type Inbox = interface {
+	Subject() string
+	Headers() map[string][]string
+	Data() []byte
+}
+
+// Subscription is an active subscription.
+type Subscription = interface {
+	Unsubscribe() error
+}
+
+// Settlement tells a Subscriber what to do with a message it delivered.
+// Transports without acknowledgements, such as core NATS, ignore it.
+type Settlement = int
+
+// Settlements. Zero is not one of them, so a forgotten value is not an Ack.
+const (
+	Ack  Settlement = iota + 1 // handled: do not deliver again
+	Nak                        // not handled: deliver again
+	Term                       // can never be handled: drop it
+)
+
+// Params are the values of a channel's address parameters, keyed by name.
+type Params map[string]string
+
+// Channel describes where messages with payload T are sent.
+type Channel[T any] struct {
+	// Address is the subject, with parameters in braces spanning whole
+	// tokens: "orders.{region}.created".
+	Address string
+	// Allowed restricts parameter values; parameters not listed accept any.
+	Allowed map[string][]string
+	// Defaults are used for parameters without a value.
+	Defaults map[string]string
+}
+
+// Subject returns the concrete subject for p.
+func (c Channel[T]) Subject(p Params) (string, error) {
+	tokens := strings.Split(c.Address, ".")
+	for i, tok := range tokens {
+		name, ok := paramName(tok)
+		if !ok {
+			continue
+		}
+		v := p[name]
+		if v == "" {
+			v = c.Defaults[name]
+		}
+		switch {
+		case v == "":
+			return "", fmt.Errorf("%s: parameter %s must not be empty", c.Address, name)
+		case strings.ContainsAny(v, ".*> \t\r\n"):
+			return "", fmt.Errorf("%s: parameter %s: %q is not a valid subject token", c.Address, name, v)
+		}
+		if allowed, ok := c.Allowed[name]; ok && !slices.Contains(allowed, v) {
+			return "", fmt.Errorf("%s: parameter %s: %q is not one of %v", c.Address, name, v, allowed)
+		}
+		tokens[i] = v
+	}
+	return strings.Join(tokens, "."), nil
+}
+
+func paramName(tok string) (string, bool) {
+	if len(tok) > 2 && tok[0] == '{' && tok[len(tok)-1] == '}' {
+		return tok[1 : len(tok)-1], true
+	}
+	return "", false
+}
+
+// ParseSubject extracts the parameters from a concrete subject.
+func (c Channel[T]) ParseSubject(subject string) (Params, error) {
+	want, got := strings.Split(c.Address, "."), strings.Split(subject, ".")
+	if len(want) != len(got) {
+		return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
+	}
+	p := Params{}
+	for i, w := range want {
+		if name, ok := paramName(w); ok {
+			p[name] = got[i]
+		} else if w != got[i] {
+			return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
+		}
+	}
+	return p, nil
+}
+
+// Endpoint is where a receive operation listens.
+type Endpoint struct {
+	Subject string
+	Queue   string
+}
+
+// Received is a decoded incoming message.
+type Received[T any] struct {
+	Subject string
+	Params  Params
+	Headers map[string][]string
+	Payload T
+}
+
+// MalformedError is about a received message that can never be handled, such
+// as one whose payload cannot be decoded. Transports recognise it by its
+// Malformed method.
+type MalformedError struct{ Err error }
+
+func (e *MalformedError) Error() string   { return "malformed message: " + e.Err.Error() }
+func (e *MalformedError) Unwrap() error   { return e.Err }
+func (e *MalformedError) Malformed() bool { return true }
+
+func decode[T any](ch Channel[T], in Inbox) (Received[T], error) {
+	r := Received[T]{Subject: in.Subject(), Headers: in.Headers()}
+	var err error
+	if r.Params, err = ch.ParseSubject(r.Subject); err != nil {
+		return r, &MalformedError{Err: err}
+	}
+	if err := json.Unmarshal(in.Data(), &r.Payload); err != nil {
+		return r, &MalformedError{Err: fmt.Errorf("%s: decode: %w", r.Subject, err)}
+	}
+	return r, nil
+}
+
+// Terminate makes a Consumer handler's error drop the message instead of
+// having it delivered again.
+func Terminate(err error) error { return &MalformedError{Err: err} }
+
+// settle maps the error of a Consumer handler to a Settlement.
+func settle(err error) (Settlement, error) {
+	var m *MalformedError
+	switch {
+	case err == nil:
+		return Ack, nil
+	case errors.As(err, &m):
+		return Term, err
+	default:
+		return Nak, err
+	}
+}
 
 // LineItem is generated from the AsyncAPI document.
 type LineItem struct {
@@ -55,115 +232,128 @@ const (
 	OrderCreatedHeaderTraceID = "traceId"
 )
 
-// JSON Schemas of the payloads, checked with broker.WithValidator.
-const (
-	schemaOrderCreated  = `{"$ref":"#/definitions/Order","definitions":{"LineItem":{"properties":{"quantity":{"format":"int32","type":"integer"},"sku":{"type":"string"}},"required":["sku","quantity"],"type":"object"},"Order":{"properties":{"customerEmail":{"type":"string"},"id":{"type":"string"},"items":{"items":{"$ref":"#/definitions/LineItem"},"type":"array"},"metadata":{"additionalProperties":{"type":"string"},"type":"object"},"status":{"$ref":"#/definitions/OrderStatus"},"total":{"type":"number"}},"required":["id","items","status"],"type":"object"},"OrderStatus":{"enum":["pending","paid","shipped","cancelled"],"type":"string"}}}`
-	schemaStatusReply   = `{"definitions":{"OrderStatus":{"enum":["pending","paid","shipped","cancelled"],"type":"string"}},"properties":{"orderId":{"type":"string"},"status":{"$ref":"#/definitions/OrderStatus"},"updatedAt":{"format":"date-time","type":"string"}},"required":["orderId","status"],"type":"object"}`
-	schemaStatusRequest = `{"properties":{"orderId":{"type":"string"}},"required":["orderId"],"type":"object"}`
-)
-
 // Channels.
 var (
 	// OrderCreatedChannel is the "orderCreated" channel.
 	// Published whenever an order is placed.
-	OrderCreatedChannel = broker.Channel[Order]{
+	OrderCreatedChannel = Channel[Order]{
 		Address: "orders.{region}.created",
 		Allowed: map[string][]string{
 			"region": {"eu", "us"},
 		},
-		Schema: schemaOrderCreated,
 	}
 	// OrderStatusChannel is the "orderStatus" channel.
-	OrderStatusChannel = broker.Channel[StatusRequest]{
+	OrderStatusChannel = Channel[StatusRequest]{
 		Address: "orders.status.get",
-		Schema:  schemaStatusRequest,
 	}
 )
 
 // Endpoints of the receive operations: the subject and queue each one
-// subscribes with, e.g. to fill in the FilterSubject of a JetStream consumer
-// passed to the operation with jsbroker.From.
+// subscribes with, e.g. to fill in the FilterSubject and Durable of a
+// JetStream consumer.
 var (
-	OnOrderCreatedEndpoint   = broker.Endpoint{Subject: "orders.*.created", Queue: "order-processors"}
-	ServeOrderStatusEndpoint = broker.Endpoint{Subject: "orders.status.get", Queue: "order-status"}
+	OnOrderCreatedEndpoint   = Endpoint{Subject: "orders.*.created", Queue: "order-processors"}
+	ServeOrderStatusEndpoint = Endpoint{Subject: "orders.status.get", Queue: "order-status"}
 )
 
 // OrderCreatedParams returns the parameters of OrderCreatedChannel.
 // region: Region the order was placed in.
-func OrderCreatedParams(region string) broker.Params {
-	return broker.Params{"region": region}
+func OrderCreatedParams(region string) Params {
+	return Params{"region": region}
 }
 
-// Producer publishes the messages of Order Service. Each method is a
-// thin wrapper around the generic functions of package broker, which can
-// also be called directly with the embedded *broker.Client.
-type Producer struct {
-	*broker.Client
-}
+// Producer publishes the messages of Order Service.
+type Producer struct{ t Publisher }
 
-// NewProducer returns a Producer on top of b, e.g. natsbroker.New(nc) or an
-// application's own broker.Publisher.
-func NewProducer(b broker.Publisher, opts ...broker.Option) *Producer {
-	return &Producer{Client: broker.ForPublisher(b, opts...)}
-}
+// NewProducer returns a Producer on top of t.
+func NewProducer(t Publisher) *Producer { return &Producer{t: t} }
 
 // Operation "publishOrderCreated": send on orders.{region}.created.
-func (c *Producer) PublishOrderCreated(ctx context.Context, params broker.Params, msg Order, opts ...broker.MsgOption) error {
-	return broker.Publish(ctx, c.Client, OrderCreatedChannel, params, msg, opts...)
+// headers may be nil.
+func (c *Producer) PublishOrderCreated(ctx context.Context, params Params, headers map[string][]string, msg Order) error {
+	subject, err := OrderCreatedChannel.Subject(params)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal Order: %w", err)
+	}
+	return c.t.Publish(ctx, subject, headers, body)
 }
 
-// Consumer subscribes to the messages of Order Service. Each method is a
-// thin wrapper around the generic functions of package broker, which can
-// also be called directly with the embedded *broker.Client.
-type Consumer struct {
-	*broker.Client
-}
+// Consumer subscribes to the messages of Order Service.
+type Consumer struct{ t Subscriber }
 
-// NewConsumer returns a Consumer on top of b, e.g. natsbroker.New(nc) or an
-// application's own broker.Subscriber.
-func NewConsumer(b broker.Subscriber, opts ...broker.Option) *Consumer {
-	return &Consumer{Client: broker.ForSubscriber(b, opts...)}
-}
+// NewConsumer returns a Consumer on top of t.
+func NewConsumer(t Subscriber) *Consumer { return &Consumer{t: t} }
 
 // Process new orders; instances share the work through a queue group.
 //
 // Operation "onOrderCreated": receive on orders.{region}.created (queue "order-processors").
-func (c *Consumer) OnOrderCreated(h broker.Handler[Order], opts ...broker.SubOption) (broker.Subscription, error) {
-	return broker.Subscribe(c.Client, OrderCreatedChannel, h, append([]broker.SubOption{broker.Queue("order-processors")}, opts...)...)
+//
+// h returning nil acks the message, an error naks it, and an error made with
+// Terminate terminates it. Malformed messages are terminated without calling h.
+func (c *Consumer) OnOrderCreated(h func(ctx context.Context, m Received[Order]) error) (Subscription, error) {
+	return c.t.Subscribe(OnOrderCreatedEndpoint.Subject, OnOrderCreatedEndpoint.Queue,
+		func(ctx context.Context, msg Inbox) (Settlement, error) {
+			r, err := decode(OrderCreatedChannel, msg)
+			if err != nil {
+				return Term, err
+			}
+			return settle(h(ctx, r))
+		})
 }
 
-// Client sends the requests of Order Service. Each method is a
-// thin wrapper around the generic functions of package broker, which can
-// also be called directly with the embedded *broker.Client.
-type Client struct {
-	*broker.Client
-}
+// Client sends the requests of Order Service.
+type Client struct{ t Requester }
 
-// NewClient returns a Client on top of b, e.g. natsbroker.New(nc) or an
-// application's own broker.Requester.
-func NewClient(b broker.Requester, opts ...broker.Option) *Client {
-	return &Client{Client: broker.ForRequester(b, opts...)}
-}
+// NewClient returns a Client on top of t.
+func NewClient(t Requester) *Client { return &Client{t: t} }
 
 // Operation "getOrderStatus": send on orders.status.get.
-func (c *Client) GetOrderStatus(ctx context.Context, req StatusRequest, opts ...broker.MsgOption) (StatusReply, error) {
-	return broker.Request[StatusRequest, StatusReply](ctx, c.Client, OrderStatusChannel.WithReplySchema(schemaStatusReply), nil, req, opts...)
+// headers may be nil.
+func (c *Client) GetOrderStatus(ctx context.Context, headers map[string][]string, req StatusRequest) (StatusReply, error) {
+	var resp StatusReply
+	subject, err := OrderStatusChannel.Subject(nil)
+	if err != nil {
+		return resp, err
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return resp, fmt.Errorf("marshal StatusRequest: %w", err)
+	}
+	reply, _, err := c.t.Request(ctx, subject, headers, body)
+	if err != nil {
+		return resp, fmt.Errorf("request %s: %w", subject, err)
+	}
+	if err := json.Unmarshal(reply, &resp); err != nil {
+		return resp, fmt.Errorf("unmarshal StatusReply: %w", err)
+	}
+	return resp, nil
 }
 
-// Server answers the requests of Order Service. Each method is a
-// thin wrapper around the generic functions of package broker, which can
-// also be called directly with the embedded *broker.Client.
-type Server struct {
-	*broker.Client
-}
+// Server answers the requests of Order Service.
+type Server struct{ t Replier }
 
-// NewServer returns a Server on top of b, e.g. natsbroker.New(nc) or an
-// application's own broker.PubSub.
-func NewServer(b broker.PubSub, opts ...broker.Option) *Server {
-	return &Server{Client: broker.ForPubSub(b, opts...)}
-}
+// NewServer returns a Server on top of t.
+func NewServer(t Replier) *Server { return &Server{t: t} }
 
 // Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").
-func (c *Server) ServeOrderStatus(h broker.Responder[StatusRequest, StatusReply], opts ...broker.SubOption) (broker.Subscription, error) {
-	return broker.Respond(c.Client, OrderStatusChannel.WithReplySchema(schemaStatusReply), h, append([]broker.SubOption{broker.Queue("order-status")}, opts...)...)
+//
+// An error from h is sent to the requester; malformed requests are answered
+// with an error without calling h.
+func (c *Server) ServeOrderStatus(h func(ctx context.Context, m Received[StatusRequest]) (StatusReply, error)) (Subscription, error) {
+	return c.t.Reply(ServeOrderStatusEndpoint.Subject, ServeOrderStatusEndpoint.Queue,
+		func(ctx context.Context, msg Inbox) ([]byte, error) {
+			r, err := decode(OrderStatusChannel, msg)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := h(ctx, r)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(resp)
+		})
 }

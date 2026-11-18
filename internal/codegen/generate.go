@@ -1,5 +1,7 @@
-// Package codegen generates models, channel definitions and thin typed
-// wrappers on top of package broker from an AsyncAPI document.
+// Package codegen generates Go code from an AsyncAPI document: models, channel
+// definitions, and typed Producer, Consumer, Client and Server types on top of
+// transport interfaces the generated code declares itself. The generated code
+// depends only on the standard library.
 package codegen
 
 import (
@@ -12,7 +14,6 @@ import (
 	"go/token"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"text/template"
 
@@ -27,8 +28,8 @@ type Part string
 
 const (
 	// PartModels is the types and header-name constants, which are always
-	// generated. Selecting only this part leaves out everything that depends
-	// on package broker.
+	// generated. Selecting only this part leaves out the channels, transports
+	// and the rest of the messaging code.
 	PartModels Part = "models"
 	// PartProducer is a Producer type with the send operations.
 	PartProducer Part = "producer"
@@ -90,12 +91,6 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 
 	tmpl, err := template.New("gen").Funcs(template.FuncMap{
 		"lines": func(s string) []string { return strings.Split(strings.TrimSpace(s), "\n") },
-		"literal": func(s string) string {
-			if strconv.CanBackquote(s) {
-				return "`" + s + "`"
-			}
-			return strconv.Quote(s)
-		},
 	}).Parse(tmplSrc)
 	if err != nil {
 		return nil, err
@@ -175,16 +170,19 @@ func checkUniqueNames(src []byte) error {
 	return nil
 }
 
-// imports returns the imports used by the generated file, other than broker.
+// imports returns the imports used by the generated file.
 func imports(m *model) []string {
 	set := map[string]bool{}
 	for _, imp := range m.Imports {
 		set[imp] = true
 	}
-	for _, op := range m.Ops {
-		if op.IsSend() {
-			set["context"] = true
+	if len(m.Ops) > 0 {
+		for _, imp := range []string{"context", "encoding/json", "fmt", "slices", "strings"} {
+			set[imp] = true
 		}
+	}
+	if m.Has(PartConsumer) {
+		set["errors"] = true
 	}
 	out := make([]string, 0, len(set))
 	for imp := range set {

@@ -28,26 +28,3 @@ func BenchmarkParse(b *testing.B) {
 		}
 	}
 }
-
-// BenchmarkPayloadSchema measures bundling every component message's payload
-// into a self-contained JSON Schema, as the generator does per message.
-func BenchmarkPayloadSchema(b *testing.B) {
-	doc, err := Parse(readBenchSpec(b))
-	if err != nil {
-		b.Fatal(err)
-	}
-	if len(doc.Components.Messages) == 0 {
-		b.Fatal("example has no component messages")
-	}
-	for b.Loop() {
-		for _, m := range doc.Components.Messages {
-			msg, _, err := doc.ResolveMessage(m)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if _, err := doc.PayloadSchema(msg); err != nil {
-				b.Fatal(err)
-			}
-		}
-	}
-}

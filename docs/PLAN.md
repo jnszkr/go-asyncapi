@@ -19,29 +19,30 @@ asyncapi-gen -spec asyncapi.yaml -out ./gen/events -package events
 | operation | `queue` (string, ≤255 chars), `bindingVersion` | `receive` ops use `QueueSubscribe` with that queue |
 | message   | none (reserved)                          | accepted, ignored                                |
 
-## Design: generic runtime, thin generated code
+## Design: self-contained generated code, pluggable transports
 
-All messaging logic lives in the importable `broker` package and is written once with
-generics: `Channel[T]`, `Publish[T]`, `Subscribe[T]`, `Request[Req, Resp]`,
-`Respond[Req, Resp]`. Transports implement the small `broker.Broker` interface
+The generated package depends only on the standard library, so applications need this
+module at build time only. Besides models, it declares the transport interfaces it needs
+(`Publisher`, `Subscriber`, `Requester`, `Replier`) over plain subjects, headers
+(`map[string][]string`) and bodies (`[]byte`), with `Inbox`, `Subscription` and
+`Settlement` as aliases of unnamed types: any transport, in any package, satisfies them
+without importing the generated code. The `broker` packages provide such transports
 (`natsbroker` for NATS, `jsbroker` for JetStream, `membroker` in memory for tests).
-
-The generator only emits what is specific to a document:
 
 | AsyncAPI                         | Generated Go                                                     |
 |----------------------------------|------------------------------------------------------------------|
 | `components.schemas.*`, message payloads | structs / named types (JSON tags, `omitempty` for optional fields) |
-| channel `address` + `parameters` | `XxxChannel = broker.Channel[T]{Address, Allowed}` and `XxxParams(...) broker.Params` |
-| `send` / `receive` operations    | one-line `Producer` / `Consumer` methods calling `Publish` / `Subscribe` (`Queue` from the NATS binding) |
-| `send` / `receive` + `reply`     | one-line `Client` / `Server` methods calling `Request` / `Respond`          |
+| channel `address` + `parameters` | `XxxChannel = Channel[T]{Address, Allowed, Defaults}` and `XxxParams(...) Params` |
+| `send` / `receive` operations    | `Producer` / `Consumer` methods on `Publisher` / `Subscriber` (`queue` from the NATS binding) |
+| `send` / `receive` + `reply`     | `Client` / `Server` methods on `Requester` / `Replier`           |
 | message `headers`                | header-name constants                                            |
-| `contentType`                    | JSON codec by default; `broker.WithCodec` to replace it          |
+| `contentType`                    | always JSON (`encoding/json`)                                    |
 
 ## Architecture
 
 ```
 cmd/asyncapi-gen      CLI entrypoint (flags, IO)
-broker/               generic runtime used by generated code
+broker/               transport contract and transports (NATS, JetStream, in memory)
 internal/spec         AsyncAPI document model, YAML/JSON loader, local $ref resolution, validation
 internal/codegen      spec → intermediate model → text/template → gofmt
 examples/             sample specs + checked-in generated output (also golden files)
@@ -58,17 +59,18 @@ examples/             sample specs + checked-in generated output (also golden fi
 2. **Using it in applications** (done)
    - Choosing the generated parts with `-generate`, and existing Go types with `x-go-type`
    - Failing on documents the generated code could not match
-   - Optional payload validation with `broker/schemavalidate`
-   - Application-supplied transports and error codecs, and interceptors
+   - Application-supplied transports
+   - Generated code that depends only on the standard library
 3. **JetStream** (outside the binding spec)
    - Done: `broker/jsbroker` publishes with stream acks and consumes from pull consumers
-     the application creates and configures, passed per subscription with `jsbroker.From`
-     or created on subscribing with `jsbroker.FromFactory`; handler errors nak, malformed
-     messages are terminated, and interceptors can settle each message themselves
+     the application creates and configures, given to the Broker with `jsbroker.WithConsumers`;
+     the handler's Settlement acks, naks or terminates each message, and interceptors can
+     settle each message themselves
    - Open: push consumers, generating stream/consumer hints from `x-` extensions
 4. **Breadth**
    - Multiple message types per channel / operation (discriminated decoding)
-   - Typed header structs on top of `broker.Header`
+   - Typed header structs
+   - Payload validation against the schemas, now that it is not built in
    - Typed `oneOf` / `anyOf` schemas
    - Nullable `type: [string, "null"]`
    - Reply addresses (an error today: replies go to the reply subject NATS provides)
