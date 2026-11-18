@@ -38,37 +38,59 @@ choose the parts you need:
 | `server` | `Server` | `receive` operations with a `reply` |
 
 Channels and parameter helpers are generated for the operations of the selected parts,
-and a part with no operations is left out. `-generate models` does not depend on
-`broker`, so it suits code that only needs the message formats. A schema or message
-named like a generated type, such as `Consumer`, is an error when that part is generated.
+and a part with no operations is left out. A schema or message named like a generated type,
+such as `Consumer` or `Ack`, is an error when that part is generated.
 
 ## How it fits together
 
+The generated package depends only on the standard library. Your application does not
+import anything from this module unless it wants one of the ready-made transports, so
+`asyncapi-gen` can stay a build-time tool, and the generated code can be copied anywhere.
+
+Besides the models, the package declares the interfaces of the transports it needs, and
+`Producer`, `Consumer`, `Client` and `Server` types on top of them:
+
+| Generated type | Takes | Method |
+|---|---|---|
+| `Producer` | `Publisher` | `Publish(ctx, subject, headers, body) error` |
+| `Consumer` | `Subscriber` | `Subscribe(filter, queue, h func(ctx, Inbox) (Settlement, error)) (Subscription, error)` |
+| `Client` | `Requester` | `Request(ctx, subject, headers, body) (replyBody, replyHeaders, error)` |
+| `Server` | `Replier` | `Reply(subject, queue, h func(ctx, Inbox) (replyBody, error)) (Subscription, error)` |
+
+Headers are `map[string][]string` and bodies `[]byte`. `Inbox` (`Subject()`, `Headers()`,
+`Data()`), `Subscription` (`Unsubscribe()`) and `Settlement` (`Ack`, `Nak`, `Term`) are
+aliases of unnamed types, so a transport written in any package satisfies these interfaces
+without importing the generated one, and one transport serves every generated package.
+
+This module has transports you can use, wrap or copy:
+
 ```
-broker/              generic, transport-agnostic runtime
-  Channel[T]         address + allowed parameter values for payload type T
-  Publish[T]         Subscribe[T]   Request[Req, Resp]   Respond[Req, Resp]
-  Broker             interface: Publish / Request / Subscribe, made up of
-                     Publisher, Requester and Subscriber
-  Endpoint           subject + queue a receive operation subscribes with
-broker/natsbroker    Broker on a *nats.Conn (core NATS)
-broker/jsbroker      Broker on JetStream, consuming from consumers you create
-broker/membroker     in-memory Broker for tests
-broker/schemavalidate  optional payload validation with JSON Schema draft-07
+broker               the same interfaces, for transports to share, and the
+                     error format of replies (*broker.RemoteError)
+broker/natsbroker    core NATS on a *nats.Conn: all four interfaces
+broker/jsbroker      JetStream, consuming from consumers you create:
+                     Publisher, Subscriber, and Requester over core NATS
+broker/membroker     in memory, for tests: all four interfaces
 ```
 
-The generated package contains only plain models, channel definitions, header-name
-constants, parameter helpers and thin `Producer`, `Consumer`, `Client` and `Server` types
-whose methods each call one generic function:
+The generated methods encode with `encoding/json`, build the subject and call the transport:
 
 ```go
-var OrderCreatedChannel = broker.Channel[Order]{
+var OrderCreatedChannel = Channel[Order]{
 	Address: "orders.{region}.created",
 	Allowed: map[string][]string{"region": {"eu", "us"}},
 }
 
-func (c *Producer) PublishOrderCreated(ctx context.Context, params broker.Params, msg Order, opts ...broker.MsgOption) error {
-	return broker.Publish(ctx, c.Client, OrderCreatedChannel, params, msg, opts...)
+func (c *Producer) PublishOrderCreated(ctx context.Context, params Params, headers map[string][]string, msg Order) error {
+	subject, err := OrderCreatedChannel.Subject(params)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal Order: %w", err)
+	}
+	return c.t.Publish(ctx, subject, headers, body)
 }
 ```
 
@@ -76,152 +98,163 @@ Using it:
 
 ```go
 nc, _ := nats.Connect(nats.DefaultURL)
-b := natsbroker.New(nc)
-consumer := orders.NewConsumer(b, broker.WithErrorHandler(log.Println))
+b := natsbroker.New(nc, natsbroker.WithErrorHandler(log.Println))
+consumer := orders.NewConsumer(b)
 producer := orders.NewProducer(b)
 client := orders.NewClient(b)
 server := orders.NewServer(b)
 
 // receive operation with a NATS `queue` binding → queue subscription on orders.*.created
-consumer.OnOrderCreated(func(ctx context.Context, m broker.Received[orders.Order]) error {
+consumer.OnOrderCreated(func(ctx context.Context, m orders.Received[orders.Order]) error {
 	log.Printf("order %s in %s", m.Payload.ID, m.Params["region"])
 	return nil
 })
 
 // send operation → publish on orders.eu.created
-producer.PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), order,
-	broker.WithHeader(orders.OrderCreatedHeaderTraceID, "t-1"))
+producer.PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"),
+	map[string][]string{orders.OrderCreatedHeaderTraceID: {"t-1"}}, order)
 
 // send operation with a reply → request/reply
-status, err := client.GetOrderStatus(ctx, orders.StatusRequest{OrderID: "o-1"})
+status, err := client.GetOrderStatus(ctx, nil, orders.StatusRequest{OrderID: "o-1"})
 
 // receive operation with a reply → answers those requests
-server.ServeOrderStatus(func(ctx context.Context, m broker.Received[orders.StatusRequest]) (orders.StatusReply, error) {
+server.ServeOrderStatus(func(ctx context.Context, m orders.Received[orders.StatusRequest]) (orders.StatusReply, error) {
 	return orders.StatusReply{OrderID: m.Payload.OrderID, Status: orders.OrderStatusPaid}, nil
 })
-
-// or skip the wrappers and use the generic functions directly
-broker.Publish(ctx, producer.Client, orders.OrderCreatedChannel, orders.OrderCreatedParams("us"), order)
 ```
 
 See [examples/orders](examples/orders) for the full spec and generated code.
 
+### Acknowledgements and errors
+
+A `Consumer` handler's error decides the `Settlement` its transport gets:
+
+| Handler | Settlement |
+|---|---|
+| returns `nil` | `Ack` |
+| returns an error | `Nak`: deliver again |
+| returns `orders.Terminate(err)` | `Term`: drop it |
+| not called: the payload cannot be decoded, or the subject does not match | `Term` |
+
+Transports without acknowledgements, such as core NATS and `membroker`, ignore it. The
+error goes to the transport too, which reports it to the `WithErrorHandler` of the
+transports here.
+
+A `Server` handler's error is sent to the requester. The transports here send it in the
+`Nats-Service-Error` / `Nats-Service-Error-Code` headers of the NATS micro protocol, and
+the `Client` returns it as `*broker.RemoteError`: code 500, or 400 for a request that could
+not be decoded. An error is the requester's fault when it has a `Malformed() bool` method
+returning true, which `broker.IsMalformed` checks.
+
 ### JetStream
 
-The same generated code runs on JetStream through `jsbroker`, which has no configuration
-of its own. Streams and consumers are not created or configured for you: retention,
-replicas, ack wait, delivery policy, filters, consume options and the rest are the
-application's. Create the consumer with the `jetstream` package and pass it to the receive
-operation with `jsbroker.From`, together with any `jetstream.PullConsumeOpt`s for `Consume`.
-The generated `XxxEndpoint` (`broker.Endpoint{Subject, Queue}`) is there if you want the
-operation's subject and queue name in the config:
+The same generated code runs on JetStream through `jsbroker`. Streams and consumers are not
+created or configured for you: retention, replicas, ack wait, delivery policy, filters,
+consume options and the rest are the application's. Create the consumer with the
+`jetstream` package and give it to the Broker with `WithConsumers`, together with any
+`jetstream.PullConsumeOpt`s for `Consume`. The generated `XxxEndpoint`
+(`Endpoint{Subject, Queue}`) holds the operation's subject and queue name for the config:
 
 ```go
 js, _ := jetstream.New(nc)
 cons, _ := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
-	Durable:       "order-processors",
+	Durable:       orders.OnOrderCreatedEndpoint.Queue,   // order-processors
 	FilterSubject: orders.OnOrderCreatedEndpoint.Subject, // orders.*.created
 	AckPolicy:     jetstream.AckExplicitPolicy,
 	AckWait:       30 * time.Second,
 })
 
-b := jsbroker.New(js)
-orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.From(cons, jetstream.PullMaxMessages(10)))
-orders.NewProducer(b).PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), order) // waits for the stream's ack
+b := jsbroker.New(js, jsbroker.WithConsumers(jsbroker.Existing(cons, jetstream.PullMaxMessages(10))))
+orders.NewConsumer(b).OnOrderCreated(handle)
+orders.NewProducer(b).PublishOrderCreated(ctx, orders.OrderCreatedParams("eu"), nil, order) // waits for the stream's ack
 ```
 
-To create the consumer when subscribing, implement `jsbroker.ConsumerFactory` or use
-`jsbroker.ConsumerFunc`, and pass it with `jsbroker.FromFactory`. The factory gets the
-subscription's subject and queue name, and returns the consumer with its consume options:
+To create consumers when subscribing, implement `jsbroker.ConsumerFactory` or use
+`jsbroker.ConsumerFunc`. It gets each subscription's filter and queue name, and returns the
+consumer with its consume options:
 
 ```go
-consumers := jsbroker.ConsumerFunc(func(cfg broker.SubConfig) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
+consumers := jsbroker.ConsumerFunc(func(filter, queue string) (jetstream.Consumer, []jetstream.PullConsumeOpt, error) {
 	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
-		Durable:       cfg.Queue,
-		FilterSubject: cfg.Subject,
+		Durable:       queue,
+		FilterSubject: filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	return cons, []jetstream.PullConsumeOpt{jetstream.PullMaxMessages(10)}, err
 })
-orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.FromFactory(consumers))
+b := jsbroker.New(js, jsbroker.WithConsumers(consumers))
 ```
 
-`FromFactory` also takes interceptors specific to JetStream, which wrap the delivery of each
-message and see the `jetstream.Msg` and the handler's error (see also
-[Interceptors](#interceptors)). Returning a different error changes what happens to
-the message, and calling `msg.NakWithDelay`, `msg.Term` or the like settles it directly. This
-one moves a message to a dead letter queue once it has failed five times, or at once if it
-cannot be decoded. Use `jsbroker.Existing` to intercept a consumer you already have:
+`jsbroker.WithInterceptors` wraps the delivery of each message. An interceptor sees the
+`jetstream.Msg` and the Settlement and error the handler returned. Returning a different
+Settlement changes what happens to the message, and calling `msg.NakWithDelay`, `msg.Term`
+or the like settles it directly. This one moves a message to a dead letter queue once it
+has failed five times, or at once if it can never be handled:
 
 ```go
 deadLetter := func(next jsbroker.Deliver) jsbroker.Deliver {
-	return func(ctx context.Context, msg jetstream.Msg) error {
-		err := next(ctx, msg)
-		if err == nil {
-			return nil
+	return func(ctx context.Context, msg jetstream.Msg) (broker.Settlement, error) {
+		s, err := next(ctx, msg)
+		if s == broker.Ack {
+			return s, err
 		}
 		md, merr := msg.Metadata()
 		if merr != nil {
-			return merr
+			return broker.Nak, merr
 		}
-		if md.NumDelivered < 5 && !errors.Is(err, broker.ErrMalformed) {
-			return err // nak: try again
+		if md.NumDelivered < 5 && s != broker.Term {
+			return s, err // try again
 		}
-		_, perr := js.Publish(ctx, "dlq."+msg.Subject(), msg.Data())
-		return perr // nil acks it, now that it is stored elsewhere
+		if _, perr := js.Publish(ctx, "dlq."+msg.Subject(), msg.Data()); perr != nil {
+			return broker.Nak, perr
+		}
+		return broker.Ack, err // stored elsewhere now
 	}
 }
-orders.NewConsumer(b).OnOrderCreated(handle, jsbroker.FromFactory(jsbroker.Existing(cons), deadLetter))
+b := jsbroker.New(js, jsbroker.WithConsumers(consumers), jsbroker.WithInterceptors(deadLetter))
 ```
 
-Without interceptors, a handler returning `nil` acks the message, an error naks it
-(redelivery), and a message that cannot be decoded is terminated. A failed ack is not
-reported: the server redelivers the message after its ack wait. Subscribing without
-`jsbroker.From` or `jsbroker.FromFactory` fails with `jsbroker.ErrNoConsumer`, and a consumer whose filter reaches outside the
-operation's subject is rejected rather than having those messages terminated. Other
-brokers reject `jsbroker.From`.
-Request/reply is not stored: `Request` goes over core NATS, and a `Server` should run on
-`natsbroker`.
+A failed ack is not reported: the server redelivers the message after its ack wait.
+Subscribing without `WithConsumers` fails with `jsbroker.ErrNoConsumer`, and a consumer
+whose filter reaches outside the operation's subject is rejected rather than having those
+messages terminated. Request/reply is not stored: `Request` goes over core NATS, and a
+`Server` runs on `natsbroker`.
 
-### Validation
+### Bringing your own transport
 
-Decoding only checks that a payload fits the Go types. To check payloads against their
-schemas, including `required`, `minimum`, `pattern`, `enum`, `not` and `if`, pass a validator:
+Like the HTTP client you hand to a generated OpenAPI client, the transport comes from
+outside, and is where tracing, authentication and the like belong. A request client needs
+one method, over whatever you already send requests with, and no import of this module:
 
 ```go
-consumer := orders.NewConsumer(b, broker.WithValidator(schemavalidate.New()))
+type requester struct{ send *mynats.RequestSender }
+
+func (r requester) Request(ctx context.Context, subject string, headers map[string][]string, body []byte) ([]byte, map[string][]string, error) {
+	return r.send.Do(ctx, subject, headers, body)
+}
+
+client := orders.NewClient(requester{send})
 ```
 
-It is off by default, and `broker` itself does not depend on a JSON Schema library: only
-programs importing `broker/schemavalidate` link one. The generated channels carry each
-message's schema with its `$ref`s resolved (`-generate models` does not include them).
+The context a transport passes to a handler becomes the context of your generated
+handler. Wrap a transport to open a span around each message:
 
-| Payload that fails | Result |
-|---|---|
-| received by `Subscribe` | not handled; goes to `WithErrorHandler`, and `jsbroker` terminates it instead of redelivering |
-| request received by `Respond` | answered with a 400 `*broker.RemoteError` |
-| about to be sent by `Publish` or `Request` | not sent; the call returns the error |
-| reply about to be sent by `Respond` | not sent; the requester gets a 500 `*broker.RemoteError` |
-| reply received by `Request` | the call returns the error |
+```go
+type traced struct{ orders.Replier }
 
-Errors wrap `broker.ErrInvalidPayload`, and those about received payloads also wrap
-`broker.ErrMalformed`. A failure to send does not, so a handler returning it has its message
-redelivered rather than dropped.
+func (t traced) Reply(subject, queue string, h func(context.Context, orders.Inbox) ([]byte, error)) (orders.Subscription, error) {
+	return t.Replier.Reply(subject, queue, func(ctx context.Context, m orders.Inbox) ([]byte, error) {
+		ctx, span := tracer.Start(extract(ctx, m.Headers()), subject)
+		defer span.End()
+		return h(ctx, m)
+	})
+}
 
-Each generated type has its own options, so validate only what you want: a `Consumer` with a
-validator next to a `Producer` without one checks incoming messages alone. A `Client` or
-`Server` checks both directions.
+server := orders.NewServer(traced{natsbroker.New(nc)})
+```
 
-- Only JSON is checked: with a `broker.WithCodec` that is not JSON, the validator is not used,
-  and neither is it for a message whose `contentType` is not JSON.
-- Message `headers` are not checked.
-- Calling `broker.Request` or `broker.Respond` directly with a generated channel checks the
-  request but not the reply, since the reply schema belongs to the operation: use the generated
-  methods, or `Channel.WithReplySchema`.
-- `pattern` uses the syntax of Go's `regexp`, so lookaheads are not available. `format` is
-  checked for the formats draft-07 defines.
-- A schema that cannot be compiled makes `Subscribe` and `Respond` fail, rather than rejecting
-  every message.
+The same works for a dead letter queue on core NATS, which has no redelivery: wrap
+`Subscribe`, and publish the message elsewhere when the handler says `Nak`.
 
 ## Mapping
 
@@ -231,122 +264,13 @@ validator next to a `Producer` without one checks incoming messages alone. A `Cl
 | `allOf` | one merged struct; members that conflict are an error |
 | `schemaFormat` + `schema` | the inner schema, for the AsyncAPI and JSON Schema draft-07 formats |
 | message and operation `traits` | merged into the message or operation |
-| channel `address` with `{params}` | `XxxChannel` (`broker.Channel[T]`) and an `XxxParams(...)` helper; parameter `enum`s become `Allowed`, `default`s become `Defaults` |
-| `send` operation | `Producer` method calling `broker.Publish` |
-| `send` + `reply` | `Client` method calling `broker.Request` |
-| `receive` operation | `Consumer` method calling `broker.Subscribe`, with `broker.Queue` when `bindings.nats.queue` is set |
-| `receive` + `reply` | `Server` method calling `broker.Respond` |
-| message `headers` | header-name constants; values are passed with `broker.WithHeader` |
+| channel `address` with `{params}` | `XxxChannel` (`Channel[T]`) and an `XxxParams(...)` helper; parameter `enum`s become `Allowed`, `default`s become `Defaults` |
+| `send` operation | `Producer` method calling `Publisher.Publish` |
+| `send` + `reply` | `Client` method calling `Requester.Request` |
+| `receive` operation | `Consumer` method calling `Subscriber.Subscribe`, with the queue of `bindings.nats.queue` |
+| `receive` + `reply` | `Server` method calling `Replier.Reply` |
+| message `headers` | header-name constants; values are passed in the `headers` argument |
 | `x-go-type` on a schema | your existing Go type instead of a generated one |
-
-Responder errors are sent back using the `Nats-Service-Error` / `Nats-Service-Error-Code`
-headers and surface as `*broker.RemoteError` on the requesting side. Use
-`broker.WithErrorCodec` to change that (see below).
-
-### Interceptors
-
-Interceptors wrap what a generated type sends and receives, on every transport and without
-writing a transport of your own. Pass them as options to the generated constructors, the
-first being the outermost:
-
-| Option | Wraps | For example |
-|---|---|---|
-| `broker.WithPublishInterceptors` | publishing, including the replies of a `Server` | adding headers |
-| `broker.WithRequestInterceptors` | sending a request and waiting for its reply | authentication, retries |
-| `broker.WithReceiveInterceptors` | decoding and handling a received message, including requests | tracing, dead letter queues |
-
-```go
-deadLetter := func(next broker.ReceiveFunc) broker.ReceiveFunc {
-	return func(ctx context.Context, m *broker.Message) error {
-		err := next(ctx, m)
-		if err == nil {
-			return nil
-		}
-		return nc.PublishMsg(&nats.Msg{Subject: "dead." + m.Subject, Header: nats.Header(m.Header), Data: m.Data})
-	}
-}
-consumer := orders.NewConsumer(natsbroker.New(nc), broker.WithReceiveInterceptors(deadLetter))
-
-authenticate := func(next broker.RequestFunc) broker.RequestFunc {
-	return func(ctx context.Context, m *broker.Message) (*broker.Message, error) {
-		m.Header.Set("Authorization", token(ctx))
-		return next(ctx, m)
-	}
-}
-client := orders.NewClient(natsbroker.New(nc), broker.WithRequestInterceptors(authenticate))
-```
-
-Core NATS has no redelivery, so the error a receive interceptor returns goes nowhere there.
-On JetStream it decides what happens to the message, as described above. A `Server` sends
-handler errors to the requester, so its receive interceptors see `nil` for those.
-
-### Bringing your own transport
-
-Like the HTTP client you hand to a generated OpenAPI client, the transport of a generated
-type comes from outside, and is where tracing, authentication and the like belong. Each
-constructor asks only for what its type uses:
-
-| Generated type | Constructor takes | Methods |
-|---|---|---|
-| `Producer` | `broker.Publisher` | `Publish` |
-| `Client` | `broker.Requester` | `Request` |
-| `Consumer` | `broker.Subscriber` | `Subscribe` |
-| `Server` | `broker.PubSub` | `Subscribe`, and `Publish` for the replies |
-
-A request client therefore needs one method, over whatever you already send requests with:
-
-```go
-type requester struct{ send *mynats.RequestSender }
-
-func (r requester) Request(ctx context.Context, m *broker.Message) (*broker.Message, error) {
-	return r.send.Do(ctx, m.Subject, m.Header, m.Data)
-}
-
-client := orders.NewClient(requester{send})
-```
-
-The embedded `*broker.Client` still accepts every generic function, and picks up whichever
-other methods your transport has. Calling one it lacks returns `broker.ErrUnsupported`.
-
-On the receiving side, the context a `Subscriber` passes to its handler becomes the context
-of your generated handler. Wrap a broker to open a span or apply a caller's deadline around
-each message:
-
-```go
-type traced struct{ broker.PubSub }
-
-func (b traced) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
-	return b.PubSub.Subscribe(cfg, func(ctx context.Context, m *broker.Message) error {
-		ctx, span := tracer.Start(extract(ctx, m.Header), cfg.Subject)
-		defer span.End()
-		return h(ctx, m)
-	})
-}
-
-server := orders.NewServer(traced{natsbroker.New(nc)})
-```
-
-Replies are published with that context's values, so `Publish` can tag them with the same
-span, but without its deadline, so a handler that ran out of time can still say so.
-
-To keep your own convention for errors in replies, implement `broker.ErrorCodec` and pass it
-with `broker.WithErrorCodec` on both sides. `DecodeError` can return your existing error
-type, and `Request` hands it to the caller unchanged:
-
-```go
-type errorCodec struct{}
-
-func (errorCodec) EncodeError(reply *broker.Message, _ string, err error) {
-	reply.Header.Set("X-Error-Message", err.Error())
-}
-
-func (errorCodec) DecodeError(reply *broker.Message) error {
-	if msg := reply.Header.Get("X-Error-Message"); msg != "" {
-		return &myproject.RequestError{Message: msg}
-	}
-	return nil
-}
-```
 
 ### Using your own types
 
@@ -393,14 +317,13 @@ stderr, and generation continues:
 
 - `oneOf` and `anyOf` as `json.RawMessage`
 - `not`, `if` and `additionalProperties` next to `properties` are not part of the Go types,
-  and are only enforced with [`broker.WithValidator`](#validation)
-- a message's payload is left out of validation when its schema cannot be used, such as a
-  `$ref` outside the document or a `pattern` Go's `regexp` cannot read
+  and are not enforced
 - parameter `location` is ignored; values are passed in the parameters
-- a non-JSON `contentType` needs a codec set with `broker.WithCodec`
+- a non-JSON `contentType`: payloads are always encoded as JSON
 
-Other validation keywords, such as `minimum` or `pattern`, are likewise only enforced with
-`broker.WithValidator`, and a `const` is otherwise only documented on its field.
+Payloads are not checked against their schemas beyond decoding into the Go types: keywords
+such as `minimum` or `pattern` are not enforced, and a `const` is only documented on its
+field.
 
 ## Status
 
@@ -411,17 +334,14 @@ See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 ## Benchmarks
 
 The generated code adds little on top of the transport: each method encodes the payload,
-builds the subject and hands the message on. Measured on an Apple M1 with Go 1.27, with a
-`struct{ Text string }` payload and JSON:
+builds the subject and hands the message on. Measured on an Apple M1 with Go 1.27, with
+the [orders example](examples/orders):
 
 | Benchmark | Time | Allocations |
 |---|---|---|
-| Publish, then receive and decode, in memory (`membroker`) | ~2.1 µs | 16 |
-| … with JSON Schema validation on both sides | ~6.1 µs | 60 |
-| Request and reply, in memory | ~6.1 µs | 43 |
-| Publish, then receive, over NATS on loopback | ~3.7 µs | 19 |
-| Request and reply over NATS on loopback (one in flight) | ~120 µs | 56 |
-| Generate the [orders example](examples/orders) from a parsed spec | ~1.3 ms | 13,744 |
+| Publish, then receive and decode, in memory (`membroker`) | ~1.5 µs | 19 |
+| Request and reply, in memory | ~3.1 µs | 24 |
+| Generate the orders example from a parsed spec | ~1.4 ms | 15,993 |
 
 Times vary by machine. Run them yourself:
 
@@ -429,7 +349,7 @@ Times vary by machine. Run them yourself:
 go test -run '^$' -bench . -benchmem ./...
 ```
 
-The benchmarks live in `bench_test.go` in `broker`, `broker/natsbroker`, `internal/spec`
+The benchmarks live in `bench_test.go` in `examples/orders/gen/orders`, `internal/spec`
 and `internal/codegen`. To compare a change, run them with `-count 10` before and after,
 and compare the two outputs with
 [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat).
@@ -437,7 +357,7 @@ and compare the two outputs with
 ## Development
 
 ```sh
-go test ./...                        # broker, golden and integration tests (embedded nats-server)
+go test ./...                        # transport, golden and integration tests (embedded nats-server)
 go test ./internal/codegen -update   # refresh golden files after template changes
 golangci-lint run                    # lint (v2, same checks as CI; config in .golangci.yml)
 go test -run '^$' -bench . ./...     # benchmarks (see Benchmarks above)

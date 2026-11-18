@@ -1,119 +1,139 @@
-// Package membroker is an in-process broker.Broker, useful for tests.
+// Package membroker is an in-process transport for generated code, useful
+// for tests. It implements every transport interface of package broker.
 //
 // Messages are delivered synchronously on the publishing goroutine. Subjects
 // match token by token, with "*" matching any single token. Subscribers
-// sharing a queue name receive messages round-robin.
+// sharing a queue name receive messages round-robin. As on core NATS, the
+// Settlement a Consumer returns is ignored, and only the message reaches a
+// handler: its context is a background one, not the sender's.
 package membroker
 
 import (
 	"context"
-	"fmt"
-	"strconv"
+	"errors"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/jnszkr/go-asyncapi/broker"
 )
 
-// Broker is an in-memory broker.Broker.
+// Broker is an in-memory transport.
 type Broker struct {
-	mu     sync.Mutex
-	subs   []*sub
-	next   map[string]int // round-robin cursor per (pattern, queue)
-	inboxN int
+	onError func(error)
+
+	mu   sync.Mutex
+	subs []*sub
+	next map[string]int // round-robin cursor per (pattern, queue)
 }
 
-var _ broker.Broker = (*Broker)(nil)
+var (
+	_ broker.Publisher  = (*Broker)(nil)
+	_ broker.Subscriber = (*Broker)(nil)
+	_ broker.Requester  = (*Broker)(nil)
+	_ broker.Replier    = (*Broker)(nil)
+)
+
+// Option configures a Broker.
+type Option func(*Broker)
+
+// WithErrorHandler receives the errors handlers return. By default they are
+// discarded.
+func WithErrorHandler(fn func(error)) Option { return func(b *Broker) { b.onError = fn } }
+
+// New returns an empty Broker.
+func New(opts ...Option) *Broker {
+	b := &Broker{onError: func(error) {}, next: map[string]int{}}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
+}
+
+// ErrNoResponders is returned by Request when no Reply subscription matches.
+var ErrNoResponders = errors.New("membroker: no responders")
 
 type sub struct {
 	b       *Broker
 	pattern string
 	queue   string
-	h       func(context.Context, *broker.Message) error
+	handle  func(context.Context, broker.Inbox) (broker.Settlement, error) // Subscribe
+	reply   func(context.Context, broker.Inbox) ([]byte, error)            // Reply
 }
 
 func (s *sub) Unsubscribe() error {
 	s.b.mu.Lock()
 	defer s.b.mu.Unlock()
-	for i, x := range s.b.subs {
-		if x == s {
-			s.b.subs = append(s.b.subs[:i], s.b.subs[i+1:]...)
-			break
-		}
-	}
+	s.b.subs = slices.DeleteFunc(s.b.subs, func(x *sub) bool { return x == s })
 	return nil
 }
 
-// New returns an empty Broker.
-func New() *Broker { return &Broker{next: map[string]int{}} }
+// Subscribe registers h.
+func (b *Broker) Subscribe(filter, queue string, h func(context.Context, broker.Inbox) (broker.Settlement, error)) (broker.Subscription, error) {
+	return b.add(&sub{b: b, pattern: filter, queue: queue, handle: h}), nil
+}
 
-// Subscribe registers h. The error h returns is ignored; there is no
-// redelivery. It supports no SubConfig.Source. As on a real transport, only
-// the message reaches h: its context is a background one, not the sender's.
-func (b *Broker) Subscribe(cfg broker.SubConfig, h func(context.Context, *broker.Message) error) (broker.Subscription, error) {
-	if cfg.Source != nil {
-		return nil, fmt.Errorf("membroker: unsupported source %T", cfg.Source)
-	}
+// Reply registers h to answer requests.
+func (b *Broker) Reply(subject, queue string, h func(context.Context, broker.Inbox) ([]byte, error)) (broker.Subscription, error) {
+	return b.add(&sub{b: b, pattern: subject, queue: queue, reply: h}), nil
+}
+
+func (b *Broker) add(s *sub) *sub {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := &sub{b: b, pattern: cfg.Subject, queue: cfg.Queue, h: h}
 	b.subs = append(b.subs, s)
-	return s, nil
+	return s
 }
 
-func (b *Broker) Publish(_ context.Context, m *broker.Message) error {
-	for _, s := range b.targets(m.Subject) {
-		_ = s.h(context.Background(), clone(m))
+// Publish delivers a message to the matching subscribers.
+func (b *Broker) Publish(_ context.Context, subject string, headers map[string][]string, body []byte) error {
+	for _, s := range b.targets(subject, false) {
+		if _, err := s.handle(context.Background(), newMessage(subject, headers, body)); err != nil {
+			b.onError(err)
+		}
 	}
 	return nil
 }
 
-func (b *Broker) Request(ctx context.Context, m *broker.Message) (*broker.Message, error) {
-	b.mu.Lock()
-	b.inboxN++
-	inbox := "_INBOX." + strconv.Itoa(b.inboxN)
-	b.mu.Unlock()
-
-	replies := make(chan *broker.Message, 1)
-	s, _ := b.Subscribe(broker.SubConfig{Subject: inbox}, func(_ context.Context, r *broker.Message) error {
-		select {
-		case replies <- r:
-		default:
-		}
-		return nil
-	})
-	defer func() { _ = s.Unsubscribe() }()
-
-	req := clone(m)
-	req.Reply = inbox
-	if len(b.targets(req.Subject)) == 0 {
-		return nil, errNoResponders
+// Request calls one matching Reply handler and returns its answer. Its error
+// travels as it would over NATS and comes back as *broker.RemoteError.
+func (b *Broker) Request(ctx context.Context, subject string, headers map[string][]string, body []byte) ([]byte, map[string][]string, error) {
+	targets := b.targets(subject, true)
+	if len(targets) == 0 {
+		return nil, nil, ErrNoResponders
 	}
-	go func() { _ = b.Publish(ctx, req) }()
+	type answer struct {
+		body []byte
+		err  error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		body, err := targets[0].reply(context.Background(), newMessage(subject, headers, body))
+		done <- answer{body, err}
+	}()
 	select {
-	case r := <-replies:
-		return r, nil
+	case a := <-done:
+		if a.err != nil {
+			b.onError(a.err)
+			h := broker.ErrorHeaders(a.err)
+			return nil, h, broker.ReplyError(h)
+		}
+		return a.body, map[string][]string{}, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 }
 
-type brokerError string
-
-func (e brokerError) Error() string { return string(e) }
-
-const errNoResponders brokerError = "membroker: no responders"
-
-// targets picks the subscribers that receive a message on subject: every
-// plain subscriber, and one subscriber per queue group.
-func (b *Broker) targets(subject string) []*sub {
+// targets picks the subscriptions of one kind that receive a message on
+// subject: every one without a queue, and one per queue group.
+func (b *Broker) targets(subject string, replies bool) []*sub {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var out []*sub
 	groups := map[string][]*sub{}
 	var order []string
 	for _, s := range b.subs {
-		if !match(s.pattern, subject) {
+		if (s.reply != nil) != replies || !match(s.pattern, subject) {
 			continue
 		}
 		if s.queue == "" {
@@ -148,11 +168,22 @@ func match(pattern, subject string) bool {
 	}
 }
 
-func clone(m *broker.Message) *broker.Message {
-	c := *m
-	c.Header = broker.Header{}
-	for k, v := range m.Header {
-		c.Header[k] = append([]string(nil), v...)
-	}
-	return &c
+// message is a received copy of a message, so that receivers cannot change
+// what the sender or other receivers see.
+type message struct {
+	subject string
+	headers map[string][]string
+	data    []byte
 }
+
+func newMessage(subject string, headers map[string][]string, data []byte) *message {
+	m := &message{subject: subject, headers: make(map[string][]string, len(headers)), data: slices.Clone(data)}
+	for k, v := range headers {
+		m.headers[k] = slices.Clone(v)
+	}
+	return m
+}
+
+func (m *message) Subject() string              { return m.subject }
+func (m *message) Headers() map[string][]string { return m.headers }
+func (m *message) Data() []byte                 { return m.data }

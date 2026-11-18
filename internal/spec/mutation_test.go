@@ -81,14 +81,3 @@ func TestResolveSchemaReturnsRefName(t *testing.T) {
 		t.Errorf("inline schema: name = %q, %v; want none", name, err)
 	}
 }
-
-func TestPayloadSchemaNumbersCollidingDefinitions(t *testing.T) {
-	got := payloadSchema(t,
-		`{properties: {a: {$ref: '#/components/schemas/A/properties/x'}, b: {$ref: '#/components/schemas/B/properties/x'}, c: {$ref: '#/components/schemas/C/properties/x'}}}`,
-		`{schemas: {A: {properties: {x: {type: string}}}, B: {properties: {x: {type: integer}}}, C: {properties: {x: {type: boolean}}}}}`)
-	for _, want := range []string{`"x":{"type":"string"}`, `"x2":{"type":"integer"}`, `"x3":{"type":"boolean"}`} {
-		if !strings.Contains(got, want) {
-			t.Errorf("got %s, want it to contain %s", got, want)
-		}
-	}
-}

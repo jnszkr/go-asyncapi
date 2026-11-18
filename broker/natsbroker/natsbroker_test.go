@@ -3,6 +3,8 @@ package natsbroker_test
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,21 +15,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-type greeting struct {
-	Text string `json:"text"`
-}
-
-type length struct {
-	N int `json:"n"`
-}
-
-var (
-	greetings = broker.Channel[greeting]{Address: "greetings"}
-	dead      = broker.Channel[greeting]{Address: "dead.greetings"}
-	measure   = broker.Channel[greeting]{Address: "measure"}
-)
-
-func setup(t testing.TB) *natsbroker.Broker {
+func conn(t testing.TB) *nats.Conn {
 	t.Helper()
 	opts := natstest.DefaultTestOptions
 	opts.Port = -1
@@ -38,113 +26,114 @@ func setup(t testing.TB) *natsbroker.Broker {
 		t.Fatal(err)
 	}
 	t.Cleanup(nc.Close)
-	return natsbroker.New(nc)
+	return nc
 }
 
-// TestReceiveInterceptorDeadLetters forwards a message whose handler failed,
-// which core NATS would otherwise lose.
-func TestReceiveInterceptorDeadLetters(t *testing.T) {
-	b := setup(t)
-	c := broker.New(b, broker.WithReceiveInterceptors(func(next broker.ReceiveFunc) broker.ReceiveFunc {
-		return func(ctx context.Context, m *broker.Message) error {
-			err := next(ctx, m)
-			if err == nil {
-				return nil
-			}
-			return b.Publish(ctx, &broker.Message{Subject: "dead." + m.Subject, Header: m.Header, Data: m.Data})
-		}
-	}))
-	if _, err := broker.Subscribe(c, greetings, func(context.Context, broker.Received[greeting]) error {
-		return errors.New("fails")
-	}); err != nil {
-		t.Fatal(err)
-	}
-	got := make(chan greeting, 1)
-	if _, err := broker.Subscribe(broker.New(b), dead, func(_ context.Context, m broker.Received[greeting]) error {
-		got <- m.Payload
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Conn().Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if err := broker.Publish(context.Background(), broker.New(b), greetings, nil, greeting{Text: "hi"}); err != nil {
-		t.Fatal(err)
-	}
+// errs collects the errors a Broker reports.
+type errs struct {
+	mu   sync.Mutex
+	list []error
+	seen chan struct{}
+}
+
+func newErrs() *errs { return &errs{seen: make(chan struct{}, 16)} }
+
+func (e *errs) add(err error) {
+	e.mu.Lock()
+	e.list = append(e.list, err)
+	e.mu.Unlock()
+	e.seen <- struct{}{}
+}
+
+func (e *errs) wait(t *testing.T) error {
+	t.Helper()
 	select {
-	case g := <-got:
-		if g.Text != "hi" {
-			t.Errorf("dead letter = %+v", g)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the dead letter")
+	case <-e.seen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for an error")
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.list[len(e.list)-1]
 }
 
-// TestRequestReplyInterceptors passes a header through a request interceptor,
-// and back through the responder's publish interceptor.
-func TestRequestReplyInterceptors(t *testing.T) {
-	b := setup(t)
-	server := broker.New(b,
-		broker.WithReceiveInterceptors(func(next broker.ReceiveFunc) broker.ReceiveFunc {
-			return func(ctx context.Context, m *broker.Message) error {
-				if m.Header.Get("Auth") != "secret" {
-					t.Errorf("request header = %v", m.Header)
-				}
-				return next(ctx, m)
-			}
-		}),
-		broker.WithPublishInterceptors(func(next broker.PublishFunc) broker.PublishFunc {
-			return func(ctx context.Context, m *broker.Message) error {
-				m.Header.Set("Served-By", "test")
-				return next(ctx, m)
-			}
-		}))
-	if _, err := broker.Respond(server, measure, func(_ context.Context, m broker.Received[greeting]) (length, error) {
-		return length{N: len(m.Payload.Text)}, nil
-	}); err != nil {
-		t.Fatal(err)
+func TestPublishSubscribe(t *testing.T) {
+	nc := conn(t)
+	reported := newErrs()
+	b := natsbroker.New(nc, natsbroker.WithErrorHandler(reported.add))
+	if b.Conn() != nc {
+		t.Error("Conn is not the connection")
 	}
-	if err := b.Conn().Flush(); err != nil {
-		t.Fatal(err)
+	type delivery struct {
+		subject string
+		headers map[string][]string
+		data    string
 	}
-	var servedBy string
-	client := broker.ForRequester(b, broker.WithRequestInterceptors(func(next broker.RequestFunc) broker.RequestFunc {
-		return func(ctx context.Context, m *broker.Message) (*broker.Message, error) {
-			m.Header.Set("Auth", "secret")
-			r, err := next(ctx, m)
-			if err == nil {
-				servedBy = r.Header.Get("Served-By")
-			}
-			return r, err
+	got := make(chan delivery, 2)
+	boom := errors.New("boom")
+	sub, err := b.Subscribe("greet.*", "", func(ctx context.Context, m broker.Inbox) (broker.Settlement, error) {
+		if ctx == nil {
+			t.Error("nil context")
 		}
-	}))
-	resp, err := broker.Request[greeting, length](context.Background(), client, measure, nil, greeting{Text: "hello"})
-	if err != nil || resp.N != 5 {
-		t.Fatalf("Request = %+v, %v", resp, err)
+		got <- delivery{m.Subject(), m.Headers(), string(m.Data())}
+		if string(m.Data()) == "fail" {
+			return broker.Nak, boom
+		}
+		return broker.Ack, nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if servedBy != "test" {
-		t.Errorf("Served-By = %q", servedBy)
+	defer sub.Unsubscribe()
+	if q := sub.(*nats.Subscription).Queue; q != "" {
+		t.Errorf("queue = %q, want none", q)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := b.Publish(ctx, "greet.en", map[string][]string{"K": {"v"}}, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	d := <-got
+	if d.subject != "greet.en" || d.data != "hi" || d.headers["K"][0] != "v" {
+		t.Errorf("received %+v", d)
+	}
+	if err := b.Publish(ctx, "greet.en", nil, []byte("fail")); err != nil {
+		t.Fatal(err)
+	}
+	if d := <-got; d.headers == nil || len(d.headers) != 0 {
+		t.Errorf("headers of a message without any = %#v, want empty", d.headers)
+	}
+	if err := reported.wait(t); !errors.Is(err, boom) {
+		t.Errorf("reported %v, want boom", err)
 	}
 }
 
 // TestQueueSubscribersShareMessages checks that a queue group delivers each
 // message to one member, not to all of them.
 func TestQueueSubscribersShareMessages(t *testing.T) {
-	c := broker.New(setup(t))
+	nc := conn(t)
+	b := natsbroker.New(nc)
 	var got atomic.Int32
 	for range 2 {
-		if _, err := broker.Subscribe(c, greetings, func(context.Context, broker.Received[greeting]) error {
+		sub, err := b.Subscribe("work", "workers", func(context.Context, broker.Inbox) (broker.Settlement, error) {
 			got.Add(1)
-			return nil
-		}, broker.Queue("workers")); err != nil {
+			return broker.Ack, nil
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
+		if q := sub.(*nats.Subscription).Queue; q != "workers" {
+			t.Errorf("queue = %q", q)
+		}
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	const n = 10
 	for range n {
-		if err := broker.Publish(context.Background(), c, greetings, nil, greeting{}); err != nil {
+		if err := b.Publish(context.Background(), "work", nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -152,9 +141,159 @@ func TestQueueSubscribersShareMessages(t *testing.T) {
 	for got.Load() < n && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	// Give any duplicate deliveries time to arrive.
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond) // time for duplicates to arrive
 	if v := got.Load(); v != n {
 		t.Errorf("handled %d messages, want %d", v, n)
 	}
+}
+
+type malformed struct{}
+
+func (malformed) Error() string   { return "bad request" }
+func (malformed) Malformed() bool { return true }
+
+func TestRequestReply(t *testing.T) {
+	nc := conn(t)
+	reported := newErrs()
+	b := natsbroker.New(nc, natsbroker.WithErrorHandler(reported.add))
+	sub, err := b.Reply("svc", "q", func(_ context.Context, m broker.Inbox) ([]byte, error) {
+		switch string(m.Data()) {
+		case "bad":
+			return nil, malformed{}
+		case "fail":
+			return nil, errors.New("cannot")
+		}
+		return []byte(m.Headers()["Who"][0] + ":" + string(m.Data())), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	if q := sub.(*nats.Subscription).Queue; q != "q" {
+		t.Errorf("queue = %q", q)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background() // no deadline: the Broker adds one
+	body, _, err := b.Request(ctx, "svc", map[string][]string{"Who": {"ann"}}, []byte("hi"))
+	if err != nil || string(body) != "ann:hi" {
+		t.Fatalf("Request = %q, %v", body, err)
+	}
+
+	for data, code := range map[string]string{"bad": broker.CodeBadRequest, "fail": broker.CodeInternal} {
+		body, h, err := b.Request(ctx, "svc", nil, []byte(data))
+		var remote *broker.RemoteError
+		if !errors.As(err, &remote) || remote.Code != code {
+			t.Errorf("%s: err = %v, want RemoteError %s", data, err, code)
+		}
+		if body != nil || h[broker.HeaderServiceErrorCode][0] != code {
+			t.Errorf("%s: body = %q, headers = %v", data, body, h)
+		}
+		if err := reported.wait(t); err == nil {
+			t.Errorf("%s: no error reported", data)
+		}
+	}
+}
+
+func TestRequestWithoutResponders(t *testing.T) {
+	b := natsbroker.New(conn(t))
+	if _, _, err := b.Request(context.Background(), "nobody", nil, nil); !errors.Is(err, nats.ErrNoResponders) {
+		t.Errorf("err = %v, want ErrNoResponders", err)
+	}
+}
+
+func TestRequestTimeout(t *testing.T) {
+	nc := conn(t)
+	// A subscriber that never answers.
+	if _, err := nc.Subscribe("slow", func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	b := natsbroker.New(nc, natsbroker.WithRequestTimeout(50*time.Millisecond))
+	start := time.Now()
+	if _, _, err := b.Request(context.Background(), "slow", nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("took %v, want about the 50ms timeout", d)
+	}
+	// A deadline of the caller's own is kept.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	b = natsbroker.New(nc, natsbroker.WithRequestTimeout(time.Hour))
+	start = time.Now()
+	if _, _, err := b.Request(ctx, "slow", nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("took %v, want about the 20ms deadline", d)
+	}
+}
+
+func TestReplyToPublishWithoutReplySubject(t *testing.T) {
+	nc := conn(t)
+	reported := newErrs()
+	b := natsbroker.New(nc, natsbroker.WithErrorHandler(reported.add))
+	called := false
+	if _, err := b.Reply("svc", "", func(context.Context, broker.Inbox) ([]byte, error) {
+		called = true
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Publish(context.Background(), "svc", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := reported.wait(t); !strings.Contains(err.Error(), "svc: request without reply subject") {
+		t.Errorf("reported %v", err)
+	}
+	if called {
+		t.Error("handler called for a message nobody waits an answer to")
+	}
+}
+
+func TestReplyFailureIsReported(t *testing.T) {
+	nc := conn(t)
+	reported := newErrs()
+	b := natsbroker.New(nc, natsbroker.WithErrorHandler(reported.add))
+	if _, err := b.Reply("svc", "", func(context.Context, broker.Inbox) ([]byte, error) {
+		return make([]byte, 2<<20), nil // over the server's max payload
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.PublishRequest("svc", "inbox.x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := reported.wait(t); !strings.Contains(err.Error(), "svc: reply:") {
+		t.Errorf("reported %v", err)
+	}
+}
+
+func TestErrorsAreDiscardedByDefault(t *testing.T) {
+	nc := conn(t)
+	b := natsbroker.New(nc)
+	done := make(chan struct{})
+	if _, err := b.Subscribe("s", "", func(context.Context, broker.Inbox) (broker.Settlement, error) {
+		defer close(done)
+		return broker.Nak, errors.New("dropped")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Publish(context.Background(), "s", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	<-done
 }
