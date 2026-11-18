@@ -134,7 +134,7 @@ A `Consumer` handler's error decides the `Settlement` its transport gets:
 | returns `nil` | `Ack` |
 | returns an error | `Nak`: deliver again |
 | returns `orders.Terminate(err)` | `Term`: drop it |
-| not called: the payload cannot be decoded, or the subject does not match | `Term` |
+| not called: the payload cannot be decoded or does not match its schema, or the subject does not match | `Term` |
 
 Transports without acknowledgements, such as core NATS and `membroker`, ignore it. The
 error goes to the transport too, which reports it to the `WithErrorHandler` of the
@@ -143,8 +143,51 @@ transports here.
 A `Server` handler's error is sent to the requester. The transports here send it in the
 `Nats-Service-Error` / `Nats-Service-Error-Code` headers of the NATS micro protocol, and
 the `Client` returns it as `*broker.RemoteError`: code 500, or 400 for a request that could
-not be decoded. An error is the requester's fault when it has a `Malformed() bool` method
-returning true, which `broker.IsMalformed` checks.
+not be decoded or does not match its schema. An error is the requester's fault when it has
+a `Malformed() bool` method returning true, which `broker.IsMalformed` checks. A reply the
+handler returns that does not match its schema is not sent: the requester gets a 500.
+
+### Validation
+
+Every payload is checked against its JSON Schema, on both sides, by a validator generated
+into the package in standard-library Go. There is nothing to turn on:
+
+| Where | What happens to a payload that does not match |
+|---|---|
+| `Producer` and `Client`, before sending | not sent; the method returns the error |
+| `Consumer`, on receipt | the handler is not called; `Term` |
+| `Server`, on receipt of a request | the handler is not called; the requester gets a 400 |
+| `Server`, before sending the reply | not sent; the requester gets a 500 |
+
+The error is a `*orders.ValidationError` listing every problem with a JSON Pointer to it,
+wrapped in a `*orders.MalformedError` when the payload was received:
+
+```go
+err := p.PublishOrderCreated(ctx, params, nil, orders.Order{ID: "o-1"})
+// Order: invalid payload: /items: want array, got null; /status: must be one of [pending paid shipped cancelled]
+
+var verr *orders.ValidationError
+if errors.As(err, &verr) {
+	fmt.Println(verr.Problems)
+}
+```
+
+Each schema becomes a variable built once at start-up, so a `$ref` is a pointer and a
+recursive schema is a cycle of them; patterns are compiled once. The validator enforces
+`type`, `enum`, `const`, `properties`, `required`, `additionalProperties`,
+`minProperties`, `maxProperties`, `items`, `minItems`, `maxItems`, `uniqueItems`,
+`minLength`, `maxLength` (in characters), `pattern`, `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum` (as numbers, or as the booleans of draft-04),
+`multipleOf`, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and the formats
+`date-time`, `date`, `time`, `email`, `uuid`, `ipv4` and `ipv6`. Generation warns about
+any other keyword or format it finds, and about patterns Go's `regexp` package cannot
+compile: those are not enforced. `pattern` uses Go's syntax (RE2), which differs from
+JSON Schema's ECMA-262 in a few places, such as lookarounds.
+
+Validation follows the JSON, not the Go types. A nil slice in a required array field is
+encoded as `null`, which is not an array, so set it to an empty slice instead. A missing
+optional property is fine; an optional property sent as `null` is checked like any other
+value.
 
 ### JetStream
 
@@ -271,6 +314,7 @@ The same works for a dead letter queue on core NATS, which has no redelivery: wr
 | `receive` + `reply` | `Server` method calling `Replier.Reply` |
 | message `headers` | header-name constants; values are passed in the `headers` argument |
 | `x-go-type` on a schema | your existing Go type instead of a generated one |
+| validation keywords (`minimum`, `pattern`, `oneOf`, ...) | checks on every payload sent and received, see [Validation](#validation) |
 
 ### Using your own types
 
@@ -315,15 +359,11 @@ Generation fails rather than producing code that does not match the document:
 What is generated with less detail than the document has is printed as a warning on
 stderr, and generation continues:
 
-- `oneOf` and `anyOf` as `json.RawMessage`
-- `not`, `if` and `additionalProperties` next to `properties` are not part of the Go types,
-  and are not enforced
+- `oneOf` and `anyOf` as `json.RawMessage`; they are still enforced
+- schema keywords and formats the validator does not enforce, such as `patternProperties`,
+  `contains` or `format: uri`, and patterns Go's `regexp` package cannot compile
 - parameter `location` is ignored; values are passed in the parameters
 - a non-JSON `contentType`: payloads are always encoded as JSON
-
-Payloads are not checked against their schemas beyond decoding into the Go types: keywords
-such as `minimum` or `pattern` are not enforced, and a `const` is only documented on its
-field.
 
 ## Status
 
@@ -334,14 +374,19 @@ See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 ## Benchmarks
 
 The generated code adds little on top of the transport: each method encodes the payload,
-builds the subject and hands the message on. Measured on an Apple M1 with Go 1.27, with
+validates it, builds the subject and hands the message on. Validation decodes the JSON a
+second time, generically, and is most of the cost. Measured on an Apple M1 with Go 1.27, with
 the [orders example](examples/orders):
 
 | Benchmark | Time | Allocations |
 |---|---|---|
-| Publish, then receive and decode, in memory (`membroker`) | ~1.5 µs | 19 |
-| Request and reply, in memory | ~3.1 µs | 24 |
-| Generate the orders example from a parsed spec | ~1.4 ms | 15,993 |
+| Publish, then receive and decode, in memory (`membroker`) | ~6.0 µs | 71 |
+| Request and reply, in memory | ~7.1 µs | 50 |
+| Generate the orders example from a parsed spec | ~2.9 ms | 28,588 |
+
+Validating the payload on both sides accounts for about 4.5 µs and 52 allocations of the
+first line, and 4 µs and 26 allocations of the second; without it they took ~1.5 µs and
+~3.1 µs.
 
 Times vary by machine. Run them yourself:
 

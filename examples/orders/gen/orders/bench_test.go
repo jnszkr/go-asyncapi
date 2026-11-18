@@ -10,7 +10,7 @@ import (
 
 // Run with: go test ./examples/orders/gen/orders -run '^$' -bench . -benchmem
 
-var benchOrder = orders.Order{ID: "o-1", Status: orders.OrderStatusPaid, Items: []orders.LineItem{{SKU: "s", Quantity: 1}}}
+var benchOrder = orders.Order{ID: "o-1", Status: orders.OrderStatusPaid, Items: []orders.LineItem{{SKU: "SKU-1", Quantity: 1}}}
 
 // BenchmarkPublishSubscribe measures the generated code on both sides of a
 // message, in memory: encode, subject, decode and parse the parameters.

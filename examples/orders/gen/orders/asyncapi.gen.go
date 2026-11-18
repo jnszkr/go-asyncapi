@@ -8,9 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net/netip"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Transport. Implement these interfaces to carry the messages, or use the
@@ -158,11 +163,16 @@ func (e *MalformedError) Error() string   { return "malformed message: " + e.Err
 func (e *MalformedError) Unwrap() error   { return e.Err }
 func (e *MalformedError) Malformed() bool { return true }
 
-func decode[T any](ch Channel[T], in Inbox) (Received[T], error) {
+// decode checks a received message against its channel and payload schema s,
+// which may be nil, and decodes it.
+func decode[T any](ch Channel[T], s *schema, in Inbox) (Received[T], error) {
 	r := Received[T]{Subject: in.Subject(), Headers: in.Headers()}
 	var err error
 	if r.Params, err = ch.ParseSubject(r.Subject); err != nil {
 		return r, &MalformedError{Err: err}
+	}
+	if err := s.validate(in.Data()); err != nil {
+		return r, &MalformedError{Err: fmt.Errorf("%s: %w", r.Subject, err)}
 	}
 	if err := json.Unmarshal(in.Data(), &r.Payload); err != nil {
 		return r, &MalformedError{Err: fmt.Errorf("%s: decode: %w", r.Subject, err)}
@@ -187,6 +197,284 @@ func settle(err error) (Settlement, error) {
 	}
 }
 
+// ValidationError is about a payload that does not match its schema. A
+// received one is wrapped in a MalformedError; one about to be sent is
+// returned as is.
+type ValidationError struct {
+	// Problems are the violations, each prefixed with a JSON Pointer to
+	// where in the payload it is.
+	Problems []string
+}
+
+func (e *ValidationError) Error() string {
+	return "invalid payload: " + strings.Join(e.Problems, "; ")
+}
+
+// schema is a JSON Schema compiled into Go. Nil fields and empty values do
+// not constrain.
+type schema struct {
+	Type     string // a JSON type; "integer" is a number without a fraction
+	Enum     []any  // decoded as by encoding/json
+	Const    any
+	HasConst bool
+
+	Properties                   map[string]*schema
+	Required                     []string
+	Additional                   *schema // the schema of properties not in Properties
+	NoAdditional                 bool    // additionalProperties: false
+	MinProperties, MaxProperties *int
+
+	Items              *schema
+	MinItems, MaxItems *int
+	UniqueItems        bool
+
+	MinLength, MaxLength *int // in characters
+	Pattern              *regexp.Regexp
+	Format               string // one of the keys of schemaFormats
+
+	Minimum, Maximum                   *float64
+	ExclusiveMinimum, ExclusiveMaximum *float64
+	MultipleOf                         *float64
+
+	AllOf, AnyOf, OneOf []*schema
+	Not, If, Then, Else *schema
+}
+
+func bound[T int | float64](v T) *T { return &v }
+
+// validate checks a JSON document against s. A nil s accepts anything.
+func (s *schema) validate(data []byte) error {
+	if s == nil {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	var problems []string
+	s.walk(v, make([]string, 0, 8), &problems)
+	if len(problems) > 0 {
+		slices.Sort(problems)
+		return &ValidationError{Problems: problems}
+	}
+	return nil
+}
+
+// walk adds the violations of v to problems. path holds the property names
+// and array indexes leading to v.
+func (s *schema) walk(v any, path []string, problems *[]string) {
+	fail := func(format string, args ...any) {
+		var at strings.Builder
+		for _, key := range path {
+			at.WriteString("/" + strings.ReplaceAll(strings.ReplaceAll(key, "~", "~0"), "/", "~1"))
+		}
+		if at.Len() == 0 {
+			at.WriteString("/")
+		}
+		*problems = append(*problems, at.String()+": "+fmt.Sprintf(format, args...))
+	}
+
+	if s.Type != "" && !jsonIs(v, s.Type) {
+		fail("want %s, got %s", s.Type, jsonTypeOf(v))
+		return // nothing else applies to a value of the wrong type
+	}
+	if s.HasConst && !jsonEqual(v, s.Const) {
+		fail("must be %v", s.Const)
+	}
+	if s.Enum != nil && !slices.ContainsFunc(s.Enum, func(e any) bool { return jsonEqual(v, e) }) {
+		fail("must be one of %v", s.Enum)
+	}
+
+	switch x := v.(type) {
+	case map[string]any:
+		for _, name := range s.Required {
+			if _, ok := x[name]; !ok {
+				fail("missing required property %q", name)
+			}
+		}
+		if s.MinProperties != nil && len(x) < *s.MinProperties {
+			fail("want at least %d properties, got %d", *s.MinProperties, len(x))
+		}
+		if s.MaxProperties != nil && len(x) > *s.MaxProperties {
+			fail("want at most %d properties, got %d", *s.MaxProperties, len(x))
+		}
+		for name, val := range x {
+			if p, ok := s.Properties[name]; ok {
+				p.walk(val, append(path, name), problems)
+			} else if s.NoAdditional {
+				fail("unexpected property %q", name)
+			} else if s.Additional != nil {
+				s.Additional.walk(val, append(path, name), problems)
+			}
+		}
+	case []any:
+		if s.MinItems != nil && len(x) < *s.MinItems {
+			fail("want at least %d items, got %d", *s.MinItems, len(x))
+		}
+		if s.MaxItems != nil && len(x) > *s.MaxItems {
+			fail("want at most %d items, got %d", *s.MaxItems, len(x))
+		}
+		if s.UniqueItems {
+			for i := 1; i < len(x); i++ {
+				if j := slices.IndexFunc(x[:i], func(e any) bool { return jsonEqual(e, x[i]) }); j >= 0 {
+					fail("items %d and %d are equal", j, i)
+					break
+				}
+			}
+		}
+		if s.Items != nil {
+			for i, item := range x {
+				s.Items.walk(item, append(path, strconv.Itoa(i)), problems)
+			}
+		}
+	case string:
+		n := utf8.RuneCountInString(x)
+		if s.MinLength != nil && n < *s.MinLength {
+			fail("want at least %d characters, got %d", *s.MinLength, n)
+		}
+		if s.MaxLength != nil && n > *s.MaxLength {
+			fail("want at most %d characters, got %d", *s.MaxLength, n)
+		}
+		if s.Pattern != nil && !s.Pattern.MatchString(x) {
+			fail("does not match %s", s.Pattern)
+		}
+		if valid, ok := schemaFormats[s.Format]; ok && !valid(x) {
+			fail("not a valid %s", s.Format)
+		}
+	case float64:
+		f := x
+		if s.Minimum != nil && f < *s.Minimum {
+			fail("must be >= %v", *s.Minimum)
+		}
+		if s.Maximum != nil && f > *s.Maximum {
+			fail("must be <= %v", *s.Maximum)
+		}
+		if s.ExclusiveMinimum != nil && f <= *s.ExclusiveMinimum {
+			fail("must be > %v", *s.ExclusiveMinimum)
+		}
+		if s.ExclusiveMaximum != nil && f >= *s.ExclusiveMaximum {
+			fail("must be < %v", *s.ExclusiveMaximum)
+		}
+		if m := s.MultipleOf; m != nil {
+			if q := f / *m; math.Abs(q-math.Round(q)) > 1e-9*math.Max(1, math.Abs(q)) {
+				fail("must be a multiple of %v", *m)
+			}
+		}
+	}
+
+	// The combinators apply to the same value. Branches are checked on their
+	// own, so that a failing anyOf branch does not report its problems when
+	// another one passes.
+	for _, sub := range s.AllOf {
+		sub.walk(v, path, problems)
+	}
+	if len(s.AnyOf) > 0 && countMatches(s.AnyOf, v, 1) == 0 {
+		fail("matches none of anyOf")
+	}
+	if len(s.OneOf) > 0 {
+		if n := countMatches(s.OneOf, v, 2); n != 1 {
+			fail("must match exactly one of oneOf, matches %s", map[int]string{0: "none", 2: "several"}[n])
+		}
+	}
+	if s.Not != nil && s.Not.matches(v) {
+		fail("must not match the not schema")
+	}
+	if s.If != nil {
+		if s.If.matches(v) {
+			if s.Then != nil {
+				s.Then.walk(v, path, problems)
+			}
+		} else if s.Else != nil {
+			s.Else.walk(v, path, problems)
+		}
+	}
+}
+
+func (s *schema) matches(v any) bool {
+	var problems []string
+	s.walk(v, nil, &problems)
+	return len(problems) == 0
+}
+
+// countMatches returns how many of ss v matches, counting up to limit.
+func countMatches(ss []*schema, v any, limit int) int {
+	n := 0
+	for _, s := range ss {
+		if s.matches(v) {
+			if n++; n == limit {
+				break
+			}
+		}
+	}
+	return n
+}
+
+// jsonIs reports whether a decoded JSON value is of a JSON Schema type.
+func jsonIs(v any, typ string) bool {
+	if typ == "integer" {
+		f, ok := v.(float64)
+		return ok && f == math.Trunc(f)
+	}
+	return jsonTypeOf(v) == typ
+}
+
+func jsonTypeOf(v any) string {
+	switch v.(type) {
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64:
+		return "number"
+	}
+	return "null"
+}
+
+// jsonEqual compares decoded JSON values.
+func jsonEqual(a, b any) bool {
+	switch a := a.(type) {
+	case []any:
+		b, ok := b.([]any)
+		return ok && slices.EqualFunc(a, b, jsonEqual)
+	case map[string]any:
+		b, ok := b.(map[string]any)
+		if !ok || len(a) != len(b) {
+			return false
+		}
+		for k, av := range a {
+			if bv, ok := b[k]; !ok || !jsonEqual(av, bv) {
+				return false
+			}
+		}
+		return true
+	}
+	return a == b
+}
+
+// schemaFormats check the formats the validator enforces.
+var schemaFormats = map[string]func(string) bool{
+	"date":      func(s string) bool { _, err := time.Parse(time.DateOnly, s); return err == nil },
+	"date-time": func(s string) bool { _, err := time.Parse(time.RFC3339, s); return err == nil },
+	"time":      func(s string) bool { _, err := time.Parse("15:04:05Z07:00", s); return err == nil },
+	"email": func(s string) bool {
+		local, domain, ok := strings.Cut(s, "@")
+		return ok && local != "" && domain != "" && !strings.ContainsAny(domain, "@ ")
+	},
+	"ipv4": func(s string) bool { a, err := netip.ParseAddr(s); return err == nil && a.Is4() },
+	"ipv6": func(s string) bool { a, err := netip.ParseAddr(s); return err == nil && a.Is6() && a.Zone() == "" },
+	"uuid": regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString,
+}
+
+// A product category; categories nest.
+type Category struct {
+	Children []Category `json:"children,omitempty"`
+	Name     string     `json:"name"`
+}
+
 // LineItem is generated from the AsyncAPI document.
 type LineItem struct {
 	Quantity int32  `json:"quantity"`
@@ -195,13 +483,15 @@ type LineItem struct {
 
 // Order is generated from the AsyncAPI document.
 type Order struct {
-	CustomerEmail *string `json:"customerEmail,omitempty"`
+	Category      *Category `json:"category,omitempty"`
+	CustomerEmail *string   `json:"customerEmail,omitempty"`
 	// Unique order identifier.
-	ID       string            `json:"id"`
-	Items    []LineItem        `json:"items"`
-	Metadata map[string]string `json:"metadata,omitempty"`
-	Status   OrderStatus       `json:"status"`
-	Total    *float64          `json:"total,omitempty"`
+	ID        string            `json:"id"`
+	Items     []LineItem        `json:"items"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	ShippedAt *time.Time        `json:"shippedAt,omitempty"`
+	Status    OrderStatus       `json:"status"`
+	Total     *float64          `json:"total,omitempty"`
 }
 
 // OrderStatus is generated from the AsyncAPI document.
@@ -256,6 +546,119 @@ var (
 	ServeOrderStatusEndpoint = Endpoint{Subject: "orders.status.get", Queue: "order-status"}
 )
 
+// Schemas of the payloads, compiled from the document. A $ref is a pointer
+// to the variable of the schema it refers to.
+var (
+	schemaCategory      = &schema{}
+	schemaLineItem      = &schema{}
+	schemaOrder         = &schema{}
+	schemaOrderStatus   = &schema{}
+	schemaStatusReply   = &schema{}
+	schemaStatusRequest = &schema{}
+)
+
+func init() {
+	*schemaCategory = schema{
+		Type:     "object",
+		Required: []string{"name"},
+		Properties: map[string]*schema{
+			"children": {
+				Type:  "array",
+				Items: schemaCategory,
+			},
+			"name": {
+				Type:      "string",
+				MinLength: bound(1),
+			},
+		},
+		NoAdditional: true,
+	}
+	*schemaLineItem = schema{
+		Type:     "object",
+		Required: []string{"sku", "quantity"},
+		Properties: map[string]*schema{
+			"quantity": {
+				Type:    "integer",
+				Minimum: bound(1.0),
+				Maximum: bound(1000.0),
+			},
+			"sku": {
+				Type:    "string",
+				Pattern: regexp.MustCompile("^[A-Z]{3}-[0-9]+$"),
+			},
+		},
+	}
+	*schemaOrder = schema{
+		Type:     "object",
+		Required: []string{"id", "items", "status"},
+		Properties: map[string]*schema{
+			"category": schemaCategory,
+			"customerEmail": {
+				Type:   "string",
+				Format: "email",
+			},
+			"id": {
+				Type:      "string",
+				MinLength: bound(1),
+			},
+			"items": {
+				Type:     "array",
+				Items:    schemaLineItem,
+				MinItems: bound(1),
+			},
+			"metadata": {
+				Type:       "object",
+				Additional: &schema{Type: "string"},
+			},
+			"shippedAt": {
+				Type:   "string",
+				Format: "date-time",
+			},
+			"status": schemaOrderStatus,
+			"total": {
+				Type:    "number",
+				Minimum: bound(0.0),
+			},
+		},
+		If: &schema{
+			Required: []string{"status"},
+			Properties: map[string]*schema{
+				"status": {
+					Const:    "shipped",
+					HasConst: true,
+				},
+			},
+		},
+		Then: &schema{Required: []string{"shippedAt"}},
+	}
+	*schemaOrderStatus = schema{
+		Type: "string",
+		Enum: []any{"pending", "paid", "shipped", "cancelled"},
+	}
+	*schemaStatusReply = schema{
+		Type:     "object",
+		Required: []string{"orderId", "status"},
+		Properties: map[string]*schema{
+			"orderId": {Type: "string"},
+			"status":  schemaOrderStatus,
+			"updatedAt": {
+				Type:   "string",
+				Format: "date-time",
+			},
+		},
+	}
+	*schemaStatusRequest = schema{
+		Type:     "object",
+		Required: []string{"orderId"},
+		Properties: map[string]*schema{
+			"orderId": {
+				Type:      "string",
+				MinLength: bound(1),
+			},
+		},
+	}
+}
+
 // OrderCreatedParams returns the parameters of OrderCreatedChannel.
 // region: Region the order was placed in.
 func OrderCreatedParams(region string) Params {
@@ -279,6 +682,9 @@ func (c *Producer) PublishOrderCreated(ctx context.Context, params Params, heade
 	if err != nil {
 		return fmt.Errorf("marshal Order: %w", err)
 	}
+	if err := schemaOrder.validate(body); err != nil {
+		return fmt.Errorf("Order: %w", err)
+	}
 	return c.t.Publish(ctx, subject, headers, body)
 }
 
@@ -293,11 +699,12 @@ func NewConsumer(t Subscriber) *Consumer { return &Consumer{t: t} }
 // Operation "onOrderCreated": receive on orders.{region}.created (queue "order-processors").
 //
 // h returning nil acks the message, an error naks it, and an error made with
-// Terminate terminates it. Malformed messages are terminated without calling h.
+// Terminate terminates it. Malformed messages, including those that do not
+// match the payload schema, are terminated without calling h.
 func (c *Consumer) OnOrderCreated(h func(ctx context.Context, m Received[Order]) error) (Subscription, error) {
 	return c.t.Subscribe(OnOrderCreatedEndpoint.Subject, OnOrderCreatedEndpoint.Queue,
 		func(ctx context.Context, msg Inbox) (Settlement, error) {
-			r, err := decode(OrderCreatedChannel, msg)
+			r, err := decode(OrderCreatedChannel, schemaOrder, msg)
 			if err != nil {
 				return Term, err
 			}
@@ -323,6 +730,9 @@ func (c *Client) GetOrderStatus(ctx context.Context, headers map[string][]string
 	if err != nil {
 		return resp, fmt.Errorf("marshal StatusRequest: %w", err)
 	}
+	if err := schemaStatusRequest.validate(body); err != nil {
+		return resp, fmt.Errorf("StatusRequest: %w", err)
+	}
 	reply, _, err := c.t.Request(ctx, subject, headers, body)
 	if err != nil {
 		return resp, fmt.Errorf("request %s: %w", subject, err)
@@ -341,12 +751,14 @@ func NewServer(t Replier) *Server { return &Server{t: t} }
 
 // Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").
 //
-// An error from h is sent to the requester; malformed requests are answered
-// with an error without calling h.
+// An error from h is sent to the requester; malformed requests, including
+// those that do not match the payload schema, are answered with an error
+// without calling h. A reply that does not match its schema is not sent:
+// the requester gets an error instead.
 func (c *Server) ServeOrderStatus(h func(ctx context.Context, m Received[StatusRequest]) (StatusReply, error)) (Subscription, error) {
 	return c.t.Reply(ServeOrderStatusEndpoint.Subject, ServeOrderStatusEndpoint.Queue,
 		func(ctx context.Context, msg Inbox) ([]byte, error) {
-			r, err := decode(OrderStatusChannel, msg)
+			r, err := decode(OrderStatusChannel, schemaStatusRequest, msg)
 			if err != nil {
 				return nil, err
 			}
@@ -354,6 +766,13 @@ func (c *Server) ServeOrderStatus(h func(ctx context.Context, m Received[StatusR
 			if err != nil {
 				return nil, err
 			}
-			return json.Marshal(resp)
+			body, err := json.Marshal(resp)
+			if err != nil {
+				return nil, fmt.Errorf("marshal StatusReply: %w", err)
+			}
+			if err := schemaStatusReply.validate(body); err != nil {
+				return nil, fmt.Errorf("StatusReply: %w", err)
+			}
+			return body, nil
 		})
 }

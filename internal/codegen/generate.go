@@ -86,6 +86,9 @@ func Generate(doc *spec.Document, opts Options) ([]byte, error) {
 		if err := requireNATS(doc); err != nil {
 			return nil, err
 		}
+		if err := m.compileSchemas(); err != nil {
+			return nil, err
+		}
 	}
 	m.Imports = imports(m)
 
@@ -177,7 +180,7 @@ func imports(m *model) []string {
 		set[imp] = true
 	}
 	if len(m.Ops) > 0 {
-		for _, imp := range []string{"context", "encoding/json", "fmt", "slices", "strings"} {
+		for _, imp := range []string{"context", "encoding/json", "fmt", "math", "net/netip", "regexp", "slices", "strconv", "strings", "time", "unicode/utf8"} {
 			set[imp] = true
 		}
 	}

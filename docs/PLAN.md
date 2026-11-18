@@ -37,6 +37,13 @@ without importing the generated code. The `broker` packages provide such transpo
 | `send` / `receive` + `reply`     | `Client` / `Server` methods on `Requester` / `Replier`           |
 | message `headers`                | header-name constants                                            |
 | `contentType`                    | always JSON (`encoding/json`)                                    |
+| schema validation keywords       | a `schema` variable per schema, checked on every payload sent and received |
+
+Validation is generated too: each schema becomes a variable of an unexported `schema`
+type, filled in `init` so that a `$ref` is a pointer and a recursive schema a pointer
+cycle, and one recursive function walks a payload decoded into `any` against it. It is
+always on, with no options: a received payload that does not match is malformed (`Term`,
+or 400 to a requester), and one about to be sent is an error (500 for a `Server` reply).
 
 ## Architecture
 
@@ -61,6 +68,8 @@ examples/             sample specs + checked-in generated output (also golden fi
    - Failing on documents the generated code could not match
    - Application-supplied transports
    - Generated code that depends only on the standard library
+   - Payload validation against the JSON Schemas, by a validator generated in
+     standard-library Go
 3. **JetStream** (outside the binding spec)
    - Done: `broker/jsbroker` publishes with stream acks and consumes from pull consumers
      the application creates and configures, given to the Broker with `jsbroker.WithConsumers`;
@@ -70,7 +79,8 @@ examples/             sample specs + checked-in generated output (also golden fi
 4. **Breadth**
    - Multiple message types per channel / operation (discriminated decoding)
    - Typed header structs
-   - Payload validation against the schemas, now that it is not built in
+   - Validation without decoding twice (a streaming validator), and the keywords it
+     does not enforce yet (`patternProperties`, `contains`, `dependencies`, more formats)
    - Typed `oneOf` / `anyOf` schemas
    - Nullable `type: [string, "null"]`
    - Reply addresses (an error today: replies go to the reply subject NATS provides)

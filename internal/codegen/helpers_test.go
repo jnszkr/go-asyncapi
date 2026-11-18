@@ -44,23 +44,21 @@ func TestEnumLiteral(t *testing.T) {
 }
 
 func TestMergeSchemaKeepsOwnAndFillsMissing(t *testing.T) {
-	not, ifs := &spec.Schema{Type: "null"}, &spec.Schema{Type: "string"}
-	member := &spec.Schema{Not: not, If: ifs, Description: "member", Title: "Member"}
+	member := &spec.Schema{Description: "member", Title: "Member"}
 
 	var empty spec.Schema
 	if err := mergeSchema(&empty, member); err != nil {
 		t.Fatal(err)
 	}
-	if empty.Not != not || empty.If != ifs || empty.Description != "member" || empty.Title != "Member" {
+	if empty.Description != "member" || empty.Title != "Member" {
 		t.Errorf("missing keywords not taken from member: %+v", empty)
 	}
 
-	ownNot, ownIf := &spec.Schema{Type: "integer"}, &spec.Schema{Type: "boolean"}
-	own := spec.Schema{Not: ownNot, If: ownIf, Description: "own", Title: "Own"}
+	own := spec.Schema{Description: "own", Title: "Own"}
 	if err := mergeSchema(&own, member); err != nil {
 		t.Fatal(err)
 	}
-	if own.Not != ownNot || own.If != ownIf || own.Description != "own" || own.Title != "Own" {
+	if own.Description != "own" || own.Title != "Own" {
 		t.Errorf("own keywords overridden by member: %+v", own)
 	}
 }

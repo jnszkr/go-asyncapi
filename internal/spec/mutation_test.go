@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -79,5 +80,67 @@ func TestResolveSchemaReturnsRefName(t *testing.T) {
 	}
 	if _, name, err := doc.ResolveSchema(&Schema{Type: "string"}); err != nil || name != "" {
 		t.Errorf("inline schema: name = %q, %v; want none", name, err)
+	}
+}
+
+func TestSchemaValidationKeywords(t *testing.T) {
+	var s Schema
+	if err := unmarshalString(`{
+		type: number, minimum: 1, maximum: 2.5, exclusiveMinimum: 0, exclusiveMaximum: true, multipleOf: 0.5,
+		minLength: 1, maxLength: 2, pattern: '^a', minItems: 3, maxItems: 4, uniqueItems: true,
+		minProperties: 5, maxProperties: 6,
+		not: {type: string}, if: {type: integer}, then: {minimum: 3}, else: {maximum: 4},
+		x-other: 1
+	}`, &s); err != nil {
+		t.Fatal(err)
+	}
+	if *s.Minimum != 1 || *s.Maximum != 2.5 || s.ExclusiveMinimum != 0 || s.ExclusiveMaximum != true || *s.MultipleOf != 0.5 {
+		t.Errorf("numbers = %v %v %v %v %v", *s.Minimum, *s.Maximum, s.ExclusiveMinimum, s.ExclusiveMaximum, *s.MultipleOf)
+	}
+	if *s.MinLength != 1 || *s.MaxLength != 2 || s.Pattern != "^a" || *s.MinItems != 3 || *s.MaxItems != 4 || !s.UniqueItems ||
+		*s.MinProperties != 5 || *s.MaxProperties != 6 {
+		t.Errorf("counts = %+v", s)
+	}
+	if s.Not.Type != "string" || s.If.Type != "integer" || *s.Then.Minimum != 3 || *s.Else.Maximum != 4 {
+		t.Errorf("subschemas = %+v %+v %+v %+v", s.Not, s.If, s.Then, s.Else)
+	}
+	want := []string{"type", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+		"minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
+		"not", "if", "then", "else", "x-other"}
+	if !slices.Equal(s.Keywords, want) {
+		t.Errorf("keywords = %q, want %q", s.Keywords, want)
+	}
+	if !s.Has("x-other") || s.Has("const") || !s.Then.Has("minimum") || s.Then.Has("type") {
+		t.Error("Has does not report the keywords the schema was written with")
+	}
+}
+
+func TestSchemaKeywordsThroughAliasesAndRefs(t *testing.T) {
+	var s struct {
+		A *Schema `yaml:"a"`
+		B *Schema `yaml:"b"`
+	}
+	if err := unmarshalString("{a: &x {const: null, enum: [1]}, b: *x}", &s); err != nil {
+		t.Fatal(err)
+	}
+	for _, sc := range []*Schema{s.A, s.B} {
+		if !slices.Equal(sc.Keywords, []string{"const", "enum"}) {
+			t.Errorf("keywords = %q", sc.Keywords)
+		}
+	}
+	// Decoding again starts afresh, as when a $ref is resolved into a
+	// schema that had keywords of its own.
+	if err := unmarshalString("{type: string}", s.A); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(s.A.Keywords, []string{"type"}) {
+		t.Errorf("keywords after decoding again = %q", s.A.Keywords)
+	}
+	var empty Schema
+	if err := unmarshalString("null", &empty); err != nil || empty.Keywords != nil {
+		t.Errorf("null schema: %q, %v", empty.Keywords, err)
+	}
+	if err := unmarshalString("{minLength: x}", &empty); err == nil {
+		t.Error("minLength: x decoded without an error")
 	}
 }

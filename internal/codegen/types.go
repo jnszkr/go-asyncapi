@@ -77,16 +77,6 @@ func (ts *typeSet) warn(format string, args ...any) {
 	ts.warned[w] = true
 }
 
-// warnIgnored warns about keywords that have no effect on the generated type.
-func (ts *typeSet) warnIgnored(s *spec.Schema, name string) {
-	if s.Not != nil {
-		ts.warn("%s: not is not enforced", name)
-	}
-	if s.If != nil {
-		ts.warn("%s: if is not enforced", name)
-	}
-}
-
 // uniqueName returns name, or name with a numeric suffix if it is taken.
 func (ts *typeSet) uniqueName(name string) string {
 	if _, taken := ts.byName[name]; !taken {
@@ -175,7 +165,6 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 		}
 		return ts.goType(merged, nameHint)
 	}
-	ts.warnIgnored(s, nameHint)
 
 	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
 		// TODO(phase 2): typed unions.
@@ -265,7 +254,6 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 	}
 	ts.declaring[s] = true
 	defer delete(ts.declaring, s)
-	ts.warnIgnored(s, name)
 	d := &typeDecl{Name: name, Doc: schemaDoc(s)}
 	// Reserve the name before descending into properties.
 	ts.add(d)
@@ -291,9 +279,6 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 			props = append(props, p)
 		}
 		sort.Strings(props)
-		if ap, ok := s.AdditionalProperties.(map[string]any); ok && len(ap) > 0 {
-			ts.warn("%s: additionalProperties next to properties is not enforced", name)
-		}
 		fields := map[string]bool{}
 		for _, p := range props {
 			if !validJSONName(p) {
@@ -407,12 +392,6 @@ func mergeSchema(out, m *spec.Schema) error {
 	out.Required = append(out.Required, m.Required...)
 	out.OneOf = append(out.OneOf, m.OneOf...)
 	out.AnyOf = append(out.AnyOf, m.AnyOf...)
-	if out.Not == nil {
-		out.Not = m.Not
-	}
-	if out.If == nil {
-		out.If = m.If
-	}
 	if out.Description == "" {
 		out.Description = m.Description
 	}
