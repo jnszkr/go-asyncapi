@@ -2,7 +2,7 @@ asyncapi: 3.0.0
 info:
   title: Validation
   version: 1.0.0
-  description: Exercises every keyword the generated validator enforces.
+  description: Exercises every keyword the generated Validate methods enforce.
 
 servers:
   local:
@@ -16,25 +16,42 @@ channels:
       sample:
         payload:
           $ref: '#/components/schemas/Sample'
+  codes:
+    address: codes
+    messages:
+      codes:
+        payload:
+          $ref: '#/components/schemas/Codes'
 
 operations:
   publishSample:
     action: send
     channel:
       $ref: '#/channels/samples'
+  publishCodes:
+    action: send
+    channel:
+      $ref: '#/channels/codes'
+  onCodes:
+    action: receive
+    channel:
+      $ref: '#/channels/codes'
 
 components:
   schemas:
     Sample:
       type: object
-      additionalProperties: false
-      maxProperties: 30
+      required: [tags]
       properties:
         int: {type: integer, multipleOf: 3}
+        int32: {type: integer, format: int32, minimum: -5, maximum: 1e12}
+        frac: {type: integer, exclusiveMinimum: 1.5}
         dec: {type: number, multipleOf: 0.1, exclusiveMinimum: 0, exclusiveMaximum: 1}
+        float: {type: number, format: float, minimum: 0.5}
         draft4: {type: number, minimum: 0, exclusiveMinimum: true, maximum: 10, exclusiveMaximum: true}
-        bool: {type: boolean}
         str: {type: string, minLength: 2, maxLength: 3}
+        min: {type: string, minLength: 1}
+        max: {type: string, maxLength: 1}
         date: {type: string, format: date}
         time: {type: string, format: time}
         dateTime: {type: string, format: date-time}
@@ -42,22 +59,35 @@ components:
         email: {type: string, format: email}
         ipv4: {type: string, format: ipv4}
         ipv6: {type: string, format: ipv6}
-        tags: {type: array, uniqueItems: true, minItems: 1, maxItems: 3}
-        values: {enum: [1, 2.5, x, true, null, [1], {a: 1}]}
-        constObject: {const: {a: [1, 2]}}
-        constNull: {const: null}
-        counts: {type: object, minProperties: 1, maxProperties: 2, additionalProperties: {type: integer}}
-        anyOf: {anyOf: [{type: string}, {type: integer}]}
-        oneOf: {oneOf: [{type: integer}, {type: number, minimum: 5}]}
+        tags: {type: array, uniqueItems: true, minItems: 1, maxItems: 3, items: {type: string}}
+        codes: {$ref: '#/components/schemas/Codes'}
+        counts: {type: object, minProperties: 1, maxProperties: 2, additionalProperties: {type: integer, minimum: 0}}
+        matrix: {type: array, items: {type: array, items: {type: integer, minimum: 0}}}
+        constStr: {const: x}
+        constNum: {type: number, const: 1.5}
+        constInt: {type: integer, const: 3}
+        constTrue: {const: true}
+        constFalse: {const: false}
         allOf: {allOf: [{type: string}, {minLength: 2}]}
-        not: {not: {type: string}}
-        ifThenElse: {if: {type: string}, then: {minLength: 3}, else: {type: integer}}
+        color: {$ref: '#/components/schemas/Color'}
         tree: {$ref: '#/components/schemas/Tree'}
-        a/b~c: {type: integer}
+        a/b~c: {type: integer, minimum: 0}
+    Code:
+      type: string
+      pattern: '^[A-Z]{2}$'
+    Codes:
+      type: array
+      maxItems: 2
+      uniqueItems: true
+      items:
+        $ref: '#/components/schemas/Code'
+    Color:
+      type: string
+      enum: [red, green]
     Tree:
       type: object
       properties:
-        value: {type: integer}
+        value: {type: integer, minimum: 0}
         children:
           type: array
           items:

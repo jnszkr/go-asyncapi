@@ -11,308 +11,537 @@ import (
 	"github.com/jnszkr/go-asyncapi/internal/spec"
 )
 
-// schemaVar is a package variable holding a compiled schema: one per $ref
-// target and per inline message payload. The variables are declared empty
-// and filled in init, so a $ref is a pointer and a recursive schema is a
-// pointer cycle.
-type schemaVar struct {
-	Name    string
-	Literal string // a schema{...} composite literal
+// Validation is generated as Go code checking the constraints of a schema on
+// the Go value of its type: a Validate method on every struct and enum type,
+// and a validateX function for every alias whose schema constrains its values.
+
+// stringFormats are the formats checked on strings: the helper function of
+// the template checking each, and the imports it needs.
+var stringFormats = map[string]struct {
+	helper  string
+	imports []string
+}{
+	"date":  {"isDate", []string{"time"}},
+	"email": {"isEmail", []string{"strings"}},
+	"ipv4":  {"isIPv4", []string{"net/netip"}},
+	"ipv6":  {"isIPv6", []string{"net/netip"}},
+	"time":  {"isTime", []string{"time"}},
+	"uuid":  {"isUUID", nil},
 }
 
-// enforcedFormats are the formats the generated validator checks. The
-// template's schemaFormats map has exactly these keys.
-var enforcedFormats = []string{"date", "date-time", "email", "ipv4", "ipv6", "time", "uuid"}
+// typeFormats only choose the Go type, so they have nothing to check.
+var typeFormats = []string{"binary", "byte", "date-time", "double", "float", "int32", "int64", "password"}
 
-// typeFormats only choose the Go type, so they have nothing to enforce.
-var typeFormats = []string{"binary", "byte", "double", "float", "int32", "int64", "password"}
-
-// unenforcedKeywords are validation keywords the generated validator does not
-// check.
-var unenforcedKeywords = []string{"additionalItems", "contains", "dependencies", "patternProperties", "propertyNames"}
-
-// schemaSet compiles the schemas of message payloads into Go literals.
-type schemaSet struct {
-	doc   *spec.Document
-	warn  func(format string, args ...any)
-	vars  []*schemaVar
-	byRef map[string]*schemaVar // canonical $ref → variable
-	names map[string]bool
+// constraintKeywords are the keywords that constrain values. One that a
+// schema has but no generated code checks is reported as not enforced.
+var constraintKeywords = []string{
+	"additionalItems", "const", "contains", "dependencies", "else", "exclusiveMaximum", "exclusiveMinimum",
+	"if", "maxItems", "maxLength", "maxProperties", "maximum", "minItems", "minLength", "minProperties",
+	"minimum", "multipleOf", "not", "pattern", "patternProperties", "propertyNames", "then", "uniqueItems",
 }
 
-func newSchemaSet(doc *spec.Document, warn func(format string, args ...any)) *schemaSet {
-	return &schemaSet{doc: doc, warn: warn, byRef: map[string]*schemaVar{}, names: map[string]bool{}}
+// pattern is a package variable holding a compiled regular expression.
+type pattern struct {
+	Name   string
+	Source string
 }
 
-// payload returns the variable holding the schema of a message payload, or
-// "" for a message without one.
-func (ss *schemaSet) payload(s *spec.Schema, msgName string) (string, error) {
-	if s == nil {
-		return "", nil
-	}
-	s, err := s.Unwrap()
-	if err != nil {
-		return "", err
-	}
-	if s.Ref != "" {
-		return ss.ref(s.Ref)
-	}
-	v := &schemaVar{Name: uniqueIn(ss.names, "schema"+msgName)}
-	ss.vars = append(ss.vars, v)
-	body, err := ss.fields(s, msgName)
-	if err != nil {
-		return "", err
-	}
-	v.Literal = "schema" + body
-	return v.Name, nil
+// Literal is the Go literal of the source.
+func (p pattern) Literal() string { return strconv.Quote(p.Source) }
+
+// validators generates the checks of the declared types.
+type validators struct {
+	ts       *typeSet
+	helpers  map[string]bool
+	patterns []pattern
+	bySource map[string]string // regexp source → pattern variable
 }
 
-// ref returns the variable of the schema a $ref points to, declaring it on
-// first use.
-func (ss *schemaSet) ref(ref string) (string, error) {
-	canonical, err := ss.doc.CanonicalRef(ref)
-	if err != nil {
-		return "", err
-	}
-	if v, ok := ss.byRef[canonical]; ok {
-		return v.Name, nil
-	}
-	resolved, _, err := ss.doc.ResolveSchema(&spec.Schema{Ref: canonical})
-	if err != nil {
-		return "", err
-	}
-	v := &schemaVar{Name: uniqueIn(ss.names, "schema"+exportName(spec.RefName(canonical)))}
-	// Register before descending so recursive schemas terminate.
-	ss.byRef[canonical] = v
-	ss.vars = append(ss.vars, v)
-	body, err := ss.fields(resolved, canonical)
-	if err != nil {
-		return "", err
-	}
-	v.Literal = "schema" + body
-	return v.Name, nil
+func newValidators(ts *typeSet) *validators {
+	return &validators{ts: ts, helpers: map[string]bool{}, bySource: map[string]string{}}
 }
 
-// expr returns the Go expression of a subschema: the variable of a $ref, or
-// an inline literal without its type, as composite literals in a slice or map
-// of *schema may leave it out.
-func (ss *schemaSet) expr(s *spec.Schema, at string) (string, error) {
-	s, err := s.Unwrap()
-	if err != nil {
-		return "", err
-	}
-	if s.Ref != "" {
-		return ss.ref(s.Ref)
-	}
-	return ss.fields(s, at)
-}
-
-// pointer is expr for a field of type *schema, where an inline literal needs
-// its type.
-func (ss *schemaSet) pointer(s *spec.Schema, at string) (string, error) {
-	e, err := ss.expr(s, at)
-	if err != nil || strings.HasPrefix(e, "schema") {
-		return e, err
-	}
-	return "&schema" + e, nil
-}
-
-// fields returns the braced fields of the schema literal for a schema
-// without $ref. at names the schema in warnings.
-func (ss *schemaSet) fields(s *spec.Schema, at string) (string, error) {
-	var fs []string
-	add := func(name, value string) { fs = append(fs, name+": "+value) }
-	sub := func(name string, s *spec.Schema, path string) error {
-		if s == nil {
-			return nil
+// run generates the Validate methods and functions of all declared types.
+func (vs *validators) run() error {
+	for _, d := range vs.ts.decls {
+		var err error
+		switch d.Kind {
+		case "struct":
+			err = vs.structChecks(d)
+		case "enum":
+			vs.enumChecks(d)
+		case "alias":
+			_, err = vs.aliasFunc(d)
 		}
-		e, err := ss.pointer(s, at+"/"+path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", d.Name, err)
+		}
+	}
+	return nil
+}
+
+// generates reports whether any Validate method or function is generated.
+func (vs *validators) generates() bool {
+	return slices.ContainsFunc(vs.ts.decls, func(d *typeDecl) bool { return d.Kind != "alias" || d.Func != "" })
+}
+
+// use records a helper of the template and the imports it needs.
+func (vs *validators) use(helper string, imports ...string) {
+	vs.helpers[helper] = true
+	for _, imp := range imports {
+		vs.ts.imports[imp] = true
+	}
+}
+
+func (vs *validators) structChecks(d *typeDecl) error {
+	for _, f := range d.Fields {
+		if f.Required && vs.nillable(f.Type) {
+			d.Checks = append(d.Checks, fmt.Sprintf("if m.%s == nil {\np.add(\"/\", \"missing required property %%q\", %q)\n}", f.Name, f.JSONName))
+		}
+		checks, err := vs.check(f.schema, f.Type, "m."+f.Name, path{}.prop(f.JSONName), d.Name+"."+f.JSONName)
 		if err != nil {
 			return err
 		}
-		add(name, e)
-		return nil
+		d.Checks = append(d.Checks, checks...)
 	}
-	list := func(name string, ss2 []*spec.Schema) error {
-		if len(ss2) == 0 {
-			return nil
-		}
-		elems := make([]string, len(ss2))
-		for i, m := range ss2 {
-			e, err := ss.expr(m, fmt.Sprintf("%s/%s/%d", at, name, i))
-			if err != nil {
-				return err
+	if s := d.schema; s != nil {
+		switch ap := s.AdditionalProperties.(type) {
+		case bool:
+			if !ap {
+				vs.ts.warn("%s: additionalProperties is not enforced", d.Name)
 			}
-			elems[i] = e
+		case map[string]any:
+			if len(ap) > 0 {
+				vs.ts.warn("%s: additionalProperties is not enforced", d.Name)
+			}
 		}
-		add(exportName(name), "[]*schema{\n"+strings.Join(elems, ",\n")+",\n}")
-		return nil
+		vs.unenforced(s, d.Name, nil)
 	}
+	return nil
+}
 
-	for _, kw := range unenforcedKeywords {
-		if s.Has(kw) {
-			ss.warn("%s: %s is not enforced", at, kw)
+func (vs *validators) enumChecks(d *typeDecl) {
+	seen := map[string]bool{}
+	for _, v := range d.Values {
+		if !seen[v.Literal] {
+			seen[v.Literal] = true
+			d.Cases = append(d.Cases, d.Name+v.Name)
 		}
 	}
+	d.OneOf = strconv.Quote("/: must be one of " + fmt.Sprint(d.schema.Enum))
+}
 
-	if s.Type != "" {
-		add("Type", strconv.Quote(s.Type))
+// aliasFunc returns the name of the function validating the values of an
+// alias, or "" if its schema does not constrain them.
+func (vs *validators) aliasFunc(d *typeDecl) (string, error) {
+	if d.checked {
+		return d.Func, nil
 	}
-	if s.Has("enum") {
-		lits := make([]string, len(s.Enum))
-		for i, v := range s.Enum {
-			lit, err := jsonLiteral(v)
-			if err != nil {
-				return "", fmt.Errorf("%s: enum: %w", at, err)
-			}
-			lits[i] = lit
-		}
-		add("Enum", "[]any{"+strings.Join(lits, ", ")+"}")
+	d.checked = true
+	if d.schema == nil || vs.ts.byName[d.Under] != nil {
+		// x-go-type, or an alias of a declared type, which validates itself.
+		return "", nil
 	}
-	if s.Has("const") {
-		lit, err := jsonLiteral(s.Const)
-		if err != nil {
-			return "", fmt.Errorf("%s: const: %w", at, err)
-		}
-		add("Const", lit)
-		add("HasConst", "true")
-	}
-
-	// Objects.
-	if len(s.Required) > 0 {
-		quoted := make([]string, len(s.Required))
-		for i, r := range s.Required {
-			quoted[i] = strconv.Quote(r)
-		}
-		add("Required", "[]string{"+strings.Join(quoted, ", ")+"}")
-	}
-	if len(s.Properties) > 0 {
-		names := sortedKeys(s.Properties)
-		entries := make([]string, len(names))
-		for i, name := range names {
-			e, err := ss.expr(s.Properties[name], at+"/properties/"+name)
-			if err != nil {
-				return "", err
-			}
-			entries[i] = strconv.Quote(name) + ": " + e
-		}
-		add("Properties", "map[string]*schema{\n"+strings.Join(entries, ",\n")+",\n}")
-	}
-	switch ap := s.AdditionalProperties.(type) {
-	case bool:
-		if !ap && !s.Has("patternProperties") {
-			add("NoAdditional", "true")
-		}
-	case map[string]any:
-		if len(ap) > 0 && !s.Has("patternProperties") {
-			var apSchema spec.Schema
-			if err := remarshal(ap, &apSchema); err != nil {
-				return "", err
-			}
-			if err := sub("Additional", &apSchema, "additionalProperties"); err != nil {
-				return "", err
-			}
-		}
-	}
-	if s.AdditionalProperties != nil && s.Has("patternProperties") {
-		ss.warn("%s: additionalProperties next to patternProperties is not enforced", at)
-	}
-	count(add, "MinProperties", s.MinProperties)
-	count(add, "MaxProperties", s.MaxProperties)
-
-	// Arrays.
-	if err := sub("Items", s.Items, "items"); err != nil {
+	checks, err := vs.check(d.schema, d.Under, "v", path{}, d.Name)
+	if err != nil || len(checks) == 0 {
 		return "", err
 	}
-	count(add, "MinItems", s.MinItems)
-	count(add, "MaxItems", s.MaxItems)
-	if s.UniqueItems {
-		add("UniqueItems", "true")
-	}
+	d.Checks, d.Func = checks, "validate"+d.Name
+	return d.Func, nil
+}
 
-	// Strings.
-	count(add, "MinLength", s.MinLength)
-	count(add, "MaxLength", s.MaxLength)
-	if s.Pattern != "" {
-		if _, err := regexp.Compile(s.Pattern); err != nil {
-			ss.warn("%s: pattern %q is not enforced: Go's regexp package does not support it", at, s.Pattern)
-		} else {
-			add("Pattern", "regexp.MustCompile("+strconv.Quote(s.Pattern)+")")
-		}
+// call returns the call validating e, a value of type t, or "" if t is not
+// a declared type with constraints. e may dereference a pointer.
+func (vs *validators) call(t, e string) (string, error) {
+	d := vs.ts.byName[t]
+	if d == nil {
+		return "", nil
+	}
+	switch d.Kind {
+	case "struct", "enum":
+		return strings.TrimPrefix(e, "*") + ".Validate()", nil
+	}
+	if c, err := vs.call(d.Under, e); c != "" || err != nil {
+		return c, err
+	}
+	fn, err := vs.aliasFunc(d)
+	if fn == "" || err != nil {
+		return "", err
+	}
+	return fn + "(" + e + ")", nil
+}
+
+// funcExpr returns a func(t) error validating values of the declared type t,
+// or "" if nothing constrains them.
+func (vs *validators) funcExpr(t string) string {
+	d := vs.ts.byName[t]
+	for d != nil && d.Kind == "alias" && d.Func == "" {
+		d = vs.ts.byName[d.Under]
 	}
 	switch {
-	case s.Format == "":
-	case slices.Contains(enforcedFormats, s.Format):
-		add("Format", strconv.Quote(s.Format))
-	case !slices.Contains(typeFormats, s.Format):
-		ss.warn("%s: format %q is not enforced", at, s.Format)
+	case d == nil:
+		return ""
+	case d.Kind == "alias":
+		return d.Func
 	}
+	return d.Name + ".Validate"
+}
 
-	// Numbers.
+// nillable reports whether a value of Go type t can be nil, which is how an
+// absent required property shows.
+func (vs *validators) nillable(t string) bool {
+	for d := vs.ts.byName[t]; d != nil && d.Kind == "alias"; d = vs.ts.byName[t] {
+		t = d.Under
+	}
+	return strings.HasPrefix(t, "*") || strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "map[") ||
+		t == "any" || t == "json.RawMessage"
+}
+
+// comparable reports whether values of Go type t can be compared with ==
+// and mean the same JSON value when they are equal.
+func (vs *validators) comparable(t string) bool {
+	for d := vs.ts.byName[t]; d != nil; d = vs.ts.byName[t] {
+		switch d.Kind {
+		case "enum":
+			return true
+		case "struct":
+			return false
+		}
+		t = d.Under
+	}
+	return slices.Contains([]string{"string", "bool", "int32", "int64", "float32", "float64"}, t)
+}
+
+// resolve follows the $refs and allOfs of s to the schema they describe.
+func (vs *validators) resolve(s *spec.Schema) (*spec.Schema, error) {
+	for range 32 {
+		if s == nil {
+			return nil, nil
+		}
+		var err error
+		if s, err = s.Unwrap(); err != nil {
+			return nil, err
+		}
+		switch {
+		case s.Ref != "":
+			if s, _, err = vs.ts.doc.ResolveSchema(s); err != nil {
+				return nil, err
+			}
+		case len(s.AllOf) > 0 && !isMapped(s):
+			if s, err = vs.ts.flatten(s, 0); err != nil {
+				return nil, err
+			}
+		default:
+			return s, nil
+		}
+	}
+	return nil, fmt.Errorf("$ref and allOf nested too deep (cycle?)")
+}
+
+// check returns statements adding the violations of e, a value of Go type t
+// generated from schema s, to the violations p, reported at path at. name
+// locates s in warnings.
+func (vs *validators) check(s *spec.Schema, t, e string, at path, name string) ([]string, error) {
+	if inner, ok := strings.CutPrefix(t, "*"); ok {
+		body, err := vs.check(s, inner, "*"+e, at, name)
+		if err != nil || len(body) == 0 {
+			return nil, err
+		}
+		return []string{"if " + e + " != nil {\n" + strings.Join(body, "\n") + "\n}"}, nil
+	}
+	call, err := vs.call(t, e)
+	if err != nil {
+		return nil, err
+	}
+	if call != "" {
+		return []string{"if err := " + call + "; err != nil {\np.nest(" + at.code() + ", err)\n}"}, nil
+	}
+	if _, declared := vs.ts.byName[t]; declared {
+		return nil, nil // a declared type without constraints
+	}
+	if s, err = vs.resolve(s); s == nil || err != nil || isMapped(s) {
+		return nil, err
+	}
+	c := &checker{vs: vs, s: s, e: e, at: at, name: name, handled: map[string]bool{}}
+	switch {
+	case t == "[]byte":
+	case strings.HasPrefix(t, "[]"):
+		err = c.array(t[2:])
+	case strings.HasPrefix(t, "map[string]"):
+		err = c.object(t[len("map[string]"):])
+	case t == "string":
+		c.string()
+	case slices.Contains([]string{"int32", "int64", "float32", "float64"}, t):
+		err = c.number(t)
+	case t == "bool":
+		c.bool()
+	}
+	if err != nil {
+		return nil, err
+	}
+	vs.unenforced(s, name, c.handled)
+	if c.counted {
+		// nil is an absent property, which a required check reports.
+		return []string{"if " + e + " != nil {\n" + strings.Join(c.out, "\n") + "\n}"}, nil
+	}
+	return c.out, nil
+}
+
+// unenforced warns about the constraints of s that no generated code checks.
+func (vs *validators) unenforced(s *spec.Schema, name string, handled map[string]bool) {
+	for _, kw := range constraintKeywords {
+		if s.Has(kw) && !handled[kw] {
+			vs.ts.warn("%s: %s is not enforced", name, kw)
+		}
+	}
+	if s.Format != "" && !handled["format"] && !slices.Contains(typeFormats, s.Format) {
+		vs.ts.warn("%s: format %q is not enforced", name, s.Format)
+	}
+}
+
+// checker generates the checks of one value.
+type checker struct {
+	vs      *validators
+	s       *spec.Schema
+	e       string // the Go expression of the value
+	at      path
+	name    string
+	handled map[string]bool // keywords checked
+	out     []string
+	// counted says whether the checks count the items or properties of a
+	// collection, which are not there when it is nil.
+	counted bool
+}
+
+// fail adds the statement "if cond { p.add(at, format, args...) }". init,
+// if not empty, is a simple statement run before cond.
+func (c *checker) fail(init, cond, format string, args ...string) {
+	if init != "" {
+		init += "; "
+	}
+	call := "p.add(" + c.at.code() + ", " + strconv.Quote(format)
+	for _, a := range args {
+		call += ", " + a
+	}
+	c.out = append(c.out, "if "+init+cond+" {\n"+call+")\n}")
+}
+
+func (c *checker) array(elem string) error {
+	s := c.s
+	if s.MinItems != nil || s.MaxItems != nil {
+		c.handled["minItems"], c.handled["maxItems"] = true, true
+		c.counts("len("+c.e+")", s.MinItems, s.MaxItems, "items")
+	}
+	c.handled["uniqueItems"] = true
+	if s.UniqueItems {
+		if c.vs.comparable(elem) {
+			c.vs.use("duplicate")
+			c.counted = true
+			c.fail("i, j, dup := duplicate("+c.e+")", "dup", "items %d and %d are equal", "i", "j")
+		} else {
+			c.vs.ts.warn("%s: uniqueItems is not enforced on items of type %s", c.name, elem)
+		}
+	}
+	n := strconv.Itoa(c.at.depth() + 1)
+	body, err := c.vs.check(s.Items, elem, "v"+n, c.at.index("strconv.Itoa(i"+n+")"), c.name+"[]")
+	if err != nil {
+		return err
+	}
+	if len(body) > 0 {
+		c.vs.ts.imports["strconv"] = true
+		c.out = append(c.out, "for i"+n+", v"+n+" := range "+c.e+" {\n"+strings.Join(body, "\n")+"\n}")
+	}
+	return nil
+}
+
+func (c *checker) object(elem string) error {
+	s := c.s
+	if s.MinProperties != nil || s.MaxProperties != nil {
+		c.handled["minProperties"], c.handled["maxProperties"] = true, true
+		c.counts("len("+c.e+")", s.MinProperties, s.MaxProperties, "properties")
+	}
+	ap, ok := s.AdditionalProperties.(map[string]any)
+	if !ok || len(ap) == 0 {
+		return nil
+	}
+	var apSchema spec.Schema
+	if err := remarshal(ap, &apSchema); err != nil {
+		return err
+	}
+	n := strconv.Itoa(c.at.depth() + 1)
+	body, err := c.vs.check(&apSchema, elem, "v"+n, c.at.index("pointerToken(k"+n+")"), c.name+"[]")
+	if err != nil {
+		return err
+	}
+	if len(body) > 0 {
+		c.vs.use("pointerToken", "strings")
+		c.out = append(c.out, "for k"+n+", v"+n+" := range "+c.e+" {\n"+strings.Join(body, "\n")+"\n}")
+	}
+	return nil
+}
+
+// counts checks a minimum and maximum count of things, of which there are n.
+func (c *checker) counts(n string, lo, hi *int, things string) {
+	c.counted = things != "characters"
+	var cond []string
+	if lo != nil {
+		cond = append(cond, fmt.Sprintf("n < %d {\np.add(%s, \"want at least %d %s, got %%d\", n)\n}", *lo, c.at.code(), *lo, things))
+	}
+	if hi != nil {
+		cond = append(cond, fmt.Sprintf("n > %d {\np.add(%s, \"want at most %d %s, got %%d\", n)\n}", *hi, c.at.code(), *hi, things))
+	}
+	c.out = append(c.out, "if n := "+n+"; "+strings.Join(cond, " else if "))
+}
+
+func (c *checker) string() {
+	s := c.s
+	if s.MinLength != nil || s.MaxLength != nil {
+		c.handled["minLength"], c.handled["maxLength"] = true, true
+		c.vs.ts.imports["unicode/utf8"] = true
+		c.counts("utf8.RuneCountInString("+c.e+")", s.MinLength, s.MaxLength, "characters")
+	}
+	if s.Pattern != "" {
+		c.handled["pattern"] = true
+		if _, err := regexp.Compile(s.Pattern); err != nil {
+			c.vs.ts.warn("%s: pattern %q is not enforced: Go's regexp package does not support it", c.name, s.Pattern)
+		} else {
+			v := c.vs.pattern(s.Pattern)
+			c.fail("", "!"+v+".MatchString("+c.e+")", "does not match %s", v)
+		}
+	}
+	if f, ok := stringFormats[s.Format]; ok {
+		c.handled["format"] = true
+		c.vs.use(f.helper, f.imports...)
+		c.fail("", "!"+f.helper+"("+c.e+")", "not a valid "+s.Format)
+	}
+	if str, ok := s.Const.(string); ok {
+		c.handled["const"] = true
+		c.fail("", c.e+" != "+strconv.Quote(str), "must be %q", strconv.Quote(str))
+	}
+}
+
+// pattern returns the variable of a compiled regular expression.
+func (vs *validators) pattern(source string) string {
+	if v, ok := vs.bySource[source]; ok {
+		return v
+	}
+	v := "pattern" + strconv.Itoa(len(vs.patterns)+1)
+	vs.bySource[source] = v
+	vs.patterns = append(vs.patterns, pattern{Name: v, Source: source})
+	vs.ts.imports["regexp"] = true
+	return v
+}
+
+func (c *checker) number(t string) error {
+	s := c.s
 	minimum, maximum := s.Minimum, s.Maximum
 	exclMin, err := exclusive(s.ExclusiveMinimum, &minimum)
 	if err != nil {
-		return "", fmt.Errorf("%s: exclusiveMinimum: %w", at, err)
+		return fmt.Errorf("%s: exclusiveMinimum: %w", c.name, err)
 	}
 	exclMax, err := exclusive(s.ExclusiveMaximum, &maximum)
 	if err != nil {
-		return "", fmt.Errorf("%s: exclusiveMaximum: %w", at, err)
+		return fmt.Errorf("%s: exclusiveMaximum: %w", c.name, err)
 	}
 	for _, b := range []struct {
-		name string
-		v    *float64
+		keyword, op, want string
+		v                 *float64
 	}{
-		{"Minimum", minimum}, {"Maximum", maximum},
-		{"ExclusiveMinimum", exclMin}, {"ExclusiveMaximum", exclMax},
-		{"MultipleOf", s.MultipleOf},
+		{"minimum", "<", ">=", minimum},
+		{"maximum", ">", "<=", maximum},
+		{"exclusiveMinimum", "<=", ">", exclMin},
+		{"exclusiveMaximum", ">=", "<", exclMax},
 	} {
 		if b.v == nil {
 			continue
 		}
-		lit, err := floatLiteral(*b.v)
-		if err != nil {
-			return "", fmt.Errorf("%s: %s: %w", at, strings.ToLower(b.name[:1])+b.name[1:], err)
+		if err := finite(*b.v); err != nil {
+			return fmt.Errorf("%s: %s: %w", c.name, b.keyword, err)
 		}
-		add(b.name, "bound("+lit+")")
+		x, lit := operands(t, c.e, *b.v)
+		c.fail("", x+" "+b.op+" "+lit, "must be "+b.want+" "+formatFloat(*b.v))
 	}
-	if s.MultipleOf != nil && *s.MultipleOf <= 0 {
-		return "", fmt.Errorf("%s: multipleOf must be greater than 0", at)
+	// A boolean exclusive bound is checked with the bound next to it.
+	for _, kw := range []string{"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"} {
+		c.handled[kw] = true
 	}
-
-	// Combinators.
-	for _, l := range []struct {
-		name string
-		ss   []*spec.Schema
-	}{{"allOf", s.AllOf}, {"anyOf", s.AnyOf}, {"oneOf", s.OneOf}} {
-		if err := list(l.name, l.ss); err != nil {
-			return "", err
+	if m := s.MultipleOf; m != nil {
+		c.handled["multipleOf"] = true
+		if err := finite(*m); err != nil || *m <= 0 {
+			return fmt.Errorf("%s: multipleOf must be a number greater than 0", c.name)
 		}
-	}
-	for _, c := range []struct {
-		name, path string
-		s          *spec.Schema
-	}{{"Not", "not", s.Not}, {"If", "if", s.If}, {"Then", "then", s.Then}, {"Else", "else", s.Else}} {
-		if err := sub(c.name, c.s, c.path); err != nil {
-			return "", err
+		if x, lit := operands(t, c.e, *m); x == c.e && strings.HasPrefix(t, "int") {
+			c.fail("", x+"%"+lit+" != 0", "must be a multiple of "+formatFloat(*m))
+		} else {
+			c.vs.use("multipleOf", "math")
+			c.fail("", "!multipleOf("+x+", "+lit+")", "must be a multiple of "+formatFloat(*m))
 		}
 	}
-
-	switch len(fs) {
-	case 0:
-		return "{}", nil
-	case 1:
-		if !strings.Contains(fs[0], "\n") {
-			return "{" + fs[0] + "}", nil
+	if s.Const != nil {
+		if f, ok := number(s.Const); ok {
+			c.handled["const"] = true
+			x, lit := operands(t, c.e, f)
+			c.fail("", x+" != "+lit, "must be "+formatFloat(f))
 		}
 	}
-	return "{\n" + strings.Join(fs, ",\n") + ",\n}", nil
+	return nil
 }
 
-// count adds a field holding a *int.
-func count(add func(name, value string), name string, n *int) {
-	if n != nil {
-		add(name, "bound("+strconv.Itoa(*n)+")")
+func (c *checker) bool() {
+	if b, ok := c.s.Const.(bool); ok {
+		c.handled["const"] = true
+		cond := c.e
+		if b {
+			cond = "!" + c.e
+		}
+		c.fail("", cond, "must be "+strconv.FormatBool(b))
 	}
+}
+
+// operands returns e and the constant b to compare it with. e is converted
+// to float64 where b is not a constant of type t.
+func operands(t, e string, b float64) (x, lit string) {
+	lit = formatFloat(b)
+	switch t {
+	case "int32", "int64":
+		limit := math.Ldexp(1, 31)
+		if t == "int64" {
+			limit = math.Ldexp(1, 63)
+		}
+		if b == math.Trunc(b) && b >= -limit && b < limit {
+			return e, lit
+		}
+	case "float64":
+		return e, lit
+	}
+	return "float64(" + e + ")", lit
+}
+
+// formatFloat formats f as Go and JSON Schema write it: whole numbers
+// without an exponent unless they are huge.
+func formatFloat(f float64) string {
+	if f == math.Trunc(f) && math.Abs(f) < 1e21 {
+		return strconv.FormatFloat(f, 'f', 0, 64) // exact, as -1 may round
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
+func finite(f float64) error {
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		return fmt.Errorf("must be finite, got %v", f)
+	}
+	return nil
+}
+
+// number returns a number in the document as a float64.
+func number(v any) (float64, bool) {
+	switch v := v.(type) {
+	case int:
+		return float64(v), true
+	case float64:
+		return v, true
+	}
+	return 0, false
 }
 
 // exclusive returns the bound of an exclusiveMinimum or exclusiveMaximum. A
@@ -331,64 +560,53 @@ func exclusive(v any, inclusive **float64) (*float64, error) {
 		b := *inclusive
 		*inclusive = nil
 		return b, nil
-	case int:
-		f := float64(v)
+	}
+	if f, ok := number(v); ok {
 		return &f, nil
-	case float64:
-		return &v, nil
 	}
 	return nil, fmt.Errorf("must be a number, got %v", v)
 }
 
-// floatLiteral returns an untyped float constant for f, so that bound infers
-// float64.
-func floatLiteral(f float64) (string, error) {
-	if math.IsInf(f, 0) || math.IsNaN(f) {
-		return "", fmt.Errorf("must be finite, got %v", f)
-	}
-	s := strconv.FormatFloat(f, 'g', -1, 64)
-	if !strings.ContainsAny(s, ".e") {
-		s += ".0"
-	}
-	return s, nil
+// path is a JSON Pointer into a validated value, as segments of Go code.
+type path []segment
+
+// segment is a reference token: a constant, or an expression computing one.
+type segment struct{ token, expr string }
+
+func (p path) prop(name string) path {
+	return append(slices.Clip(p), segment{token: strings.ReplaceAll(strings.ReplaceAll(name, "~", "~0"), "/", "~1")})
 }
 
-// jsonLiteral returns the Go literal of a value in the document as
-// encoding/json decodes it into any: numbers as float64, objects as
-// map[string]any and arrays as []any.
-func jsonLiteral(v any) (string, error) {
-	switch v := v.(type) {
-	case nil:
-		return "nil", nil
-	case bool:
-		return strconv.FormatBool(v), nil
-	case string:
-		return strconv.Quote(v), nil
-	case int:
-		return floatLiteral(float64(v))
-	case float64:
-		return floatLiteral(v)
-	case []any:
-		elems := make([]string, len(v))
-		for i, e := range v {
-			lit, err := jsonLiteral(e)
-			if err != nil {
-				return "", err
-			}
-			elems[i] = lit
+func (p path) index(expr string) path { return append(slices.Clip(p), segment{expr: expr}) }
+
+// depth returns the number of computed tokens, which is how many loops the
+// value is in.
+func (p path) depth() int {
+	n := 0
+	for _, s := range p {
+		if s.expr != "" {
+			n++
 		}
-		return "[]any{" + strings.Join(elems, ", ") + "}", nil
-	case map[string]any:
-		keys := sortedKeys(v)
-		entries := make([]string, len(keys))
-		for i, k := range keys {
-			lit, err := jsonLiteral(v[k])
-			if err != nil {
-				return "", err
-			}
-			entries[i] = strconv.Quote(k) + ": " + lit
-		}
-		return "map[string]any{" + strings.Join(entries, ", ") + "}", nil
 	}
-	return "", fmt.Errorf("%v (%T) is not a JSON value", v, v)
+	return n
+}
+
+// code returns the Go expression of the pointer.
+func (p path) code() string {
+	if len(p) == 0 {
+		return `"/"`
+	}
+	var parts []string
+	lit := ""
+	for _, s := range p {
+		lit += "/" + s.token
+		if s.expr != "" {
+			parts = append(parts, strconv.Quote(lit), s.expr)
+			lit = ""
+		}
+	}
+	if lit != "" {
+		parts = append(parts, strconv.Quote(lit))
+	}
+	return strings.Join(parts, "+")
 }

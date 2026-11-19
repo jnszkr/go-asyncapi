@@ -6,6 +6,7 @@ package validation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/netip"
@@ -26,6 +27,38 @@ import (
 type Publisher interface {
 	Publish(ctx context.Context, subject string, headers map[string][]string, body []byte) error
 }
+
+// Subscriber is the transport of Consumer.
+type Subscriber interface {
+	// Subscribe calls h for every message matching filter, whose tokens may
+	// be "*". Subscribers sharing queue split the messages between them. The
+	// returned Settlement says what to do with the message; the error, if any,
+	// says why and is for the transport to report.
+	Subscribe(filter, queue string, h func(ctx context.Context, msg Inbox) (Settlement, error)) (Subscription, error)
+}
+
+// Inbox is a received message.
+type Inbox = interface {
+	Subject() string
+	Headers() map[string][]string
+	Data() []byte
+}
+
+// Subscription is an active subscription.
+type Subscription = interface {
+	Unsubscribe() error
+}
+
+// Settlement tells a Subscriber what to do with a message it delivered.
+// Transports without acknowledgements, such as core NATS, ignore it.
+type Settlement = int
+
+// Settlements. Zero is not one of them, so a forgotten value is not an Ack.
+const (
+	Ack  Settlement = iota + 1 // handled: do not deliver again
+	Nak                        // not handled: deliver again
+	Term                       // can never be handled: drop it
+)
 
 // Params are the values of a channel's address parameters, keyed by name.
 type Params map[string]string
@@ -74,12 +107,88 @@ func paramName(tok string) (string, bool) {
 	return "", false
 }
 
-// ValidationError is about a payload that does not match its schema. A
-// received one is wrapped in a MalformedError; one about to be sent is
-// returned as is.
+// ParseSubject extracts the parameters from a concrete subject.
+func (c Channel[T]) ParseSubject(subject string) (Params, error) {
+	want, got := strings.Split(c.Address, "."), strings.Split(subject, ".")
+	if len(want) != len(got) {
+		return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
+	}
+	p := Params{}
+	for i, w := range want {
+		if name, ok := paramName(w); ok {
+			p[name] = got[i]
+		} else if w != got[i] {
+			return nil, fmt.Errorf("subject %q does not match %s", subject, c.Address)
+		}
+	}
+	return p, nil
+}
+
+// Endpoint is where a receive operation listens.
+type Endpoint struct {
+	Subject string
+	Queue   string
+}
+
+// Received is a decoded incoming message.
+type Received[T any] struct {
+	Subject string
+	Params  Params
+	Headers map[string][]string
+	Payload T
+}
+
+// MalformedError is about a received message that can never be handled, such
+// as one whose payload cannot be decoded. Transports recognise it by its
+// Malformed method.
+type MalformedError struct{ Err error }
+
+func (e *MalformedError) Error() string   { return "malformed message: " + e.Err.Error() }
+func (e *MalformedError) Unwrap() error   { return e.Err }
+func (e *MalformedError) Malformed() bool { return true }
+
+// decode checks a received message against its channel, decodes it and
+// validates the payload with valid, which may be nil.
+func decode[T any](ch Channel[T], valid func(T) error, in Inbox) (Received[T], error) {
+	r := Received[T]{Subject: in.Subject(), Headers: in.Headers()}
+	var err error
+	if r.Params, err = ch.ParseSubject(r.Subject); err != nil {
+		return r, &MalformedError{Err: err}
+	}
+	if err := json.Unmarshal(in.Data(), &r.Payload); err != nil {
+		return r, &MalformedError{Err: fmt.Errorf("%s: decode: %w", r.Subject, err)}
+	}
+	if valid != nil {
+		if err := valid(r.Payload); err != nil {
+			return r, &MalformedError{Err: fmt.Errorf("%s: %w", r.Subject, err)}
+		}
+	}
+	return r, nil
+}
+
+// Terminate makes a Consumer handler's error drop the message instead of
+// having it delivered again.
+func Terminate(err error) error { return &MalformedError{Err: err} }
+
+// settle maps the error of a Consumer handler to a Settlement.
+func settle(err error) (Settlement, error) {
+	var m *MalformedError
+	switch {
+	case err == nil:
+		return Ack, nil
+	case errors.As(err, &m):
+		return Term, err
+	default:
+		return Nak, err
+	}
+}
+
+// ValidationError is about a value that breaks the constraints of its
+// schema. A received payload that does not validate is wrapped in a
+// MalformedError; one about to be sent is returned as is.
 type ValidationError struct {
-	// Problems are the violations, each prefixed with a JSON Pointer to
-	// where in the payload it is.
+	// Problems are the violations, sorted, each prefixed with a JSON
+	// Pointer to where in the value it is.
 	Problems []string
 }
 
@@ -87,292 +196,366 @@ func (e *ValidationError) Error() string {
 	return "invalid payload: " + strings.Join(e.Problems, "; ")
 }
 
-// schema is a JSON Schema compiled into Go. Nil fields and empty values do
-// not constrain.
-type schema struct {
-	Type     string // a JSON type; "integer" is a number without a fraction
-	Enum     []any  // decoded as by encoding/json
-	Const    any
-	HasConst bool
+// violations collects the problems a Validate method finds.
+type violations []string
 
-	Properties                   map[string]*schema
-	Required                     []string
-	Additional                   *schema // the schema of properties not in Properties
-	NoAdditional                 bool    // additionalProperties: false
-	MinProperties, MaxProperties *int
-
-	Items              *schema
-	MinItems, MaxItems *int
-	UniqueItems        bool
-
-	MinLength, MaxLength *int // in characters
-	Pattern              *regexp.Regexp
-	Format               string // one of the keys of schemaFormats
-
-	Minimum, Maximum                   *float64
-	ExclusiveMinimum, ExclusiveMaximum *float64
-	MultipleOf                         *float64
-
-	AllOf, AnyOf, OneOf []*schema
-	Not, If, Then, Else *schema
+func (p *violations) add(at, format string, args ...any) {
+	*p = append(*p, at+": "+fmt.Sprintf(format, args...))
 }
 
-func bound[T int | float64](v T) *T { return &v }
+// nest adds the problems of err, about the value at, under at.
+func (p *violations) nest(at string, err error) {
+	v, ok := err.(*ValidationError)
+	if !ok {
+		p.add(at, "%v", err)
+		return
+	}
+	for _, q := range v.Problems {
+		if strings.HasPrefix(q, "/:") {
+			q = q[1:] // about the value itself
+		}
+		*p = append(*p, at+q)
+	}
+}
 
-// validate checks a JSON document against s. A nil s accepts anything.
-func (s *schema) validate(data []byte) error {
-	if s == nil {
+func (p violations) err() error {
+	if len(p) == 0 {
 		return nil
 	}
-	var v any
-	if err := json.Unmarshal(data, &v); err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
-	var problems []string
-	s.walk(v, make([]string, 0, 8), &problems)
-	if len(problems) > 0 {
-		slices.Sort(problems)
-		return &ValidationError{Problems: problems}
-	}
-	return nil
+	slices.Sort(p)
+	return &ValidationError{Problems: p}
 }
 
-// walk adds the violations of v to problems. path holds the property names
-// and array indexes leading to v.
-func (s *schema) walk(v any, path []string, problems *[]string) {
-	fail := func(format string, args ...any) {
-		var at strings.Builder
-		for _, key := range path {
-			at.WriteString("/" + strings.ReplaceAll(strings.ReplaceAll(key, "~", "~0"), "/", "~1"))
-		}
-		if at.Len() == 0 {
-			at.WriteString("/")
-		}
-		*problems = append(*problems, at.String()+": "+fmt.Sprintf(format, args...))
-	}
+var (
+	pattern1 = regexp.MustCompile("^[A-Z]{2}$")
+)
 
-	if s.Type != "" && !jsonIs(v, s.Type) {
-		fail("want %s, got %s", s.Type, jsonTypeOf(v))
-		return // nothing else applies to a value of the wrong type
+// duplicate returns the indexes of the first two equal items of s.
+func duplicate[T comparable](s []T) (i, j int, ok bool) {
+	seen := make(map[T]int, len(s))
+	for j, v := range s {
+		if i, ok := seen[v]; ok {
+			return i, j, true
+		}
+		seen[v] = j
 	}
-	if s.HasConst && !jsonEqual(v, s.Const) {
-		fail("must be %v", s.Const)
-	}
-	if s.Enum != nil && !slices.ContainsFunc(s.Enum, func(e any) bool { return jsonEqual(v, e) }) {
-		fail("must be one of %v", s.Enum)
-	}
-
-	switch x := v.(type) {
-	case map[string]any:
-		for _, name := range s.Required {
-			if _, ok := x[name]; !ok {
-				fail("missing required property %q", name)
-			}
-		}
-		if s.MinProperties != nil && len(x) < *s.MinProperties {
-			fail("want at least %d properties, got %d", *s.MinProperties, len(x))
-		}
-		if s.MaxProperties != nil && len(x) > *s.MaxProperties {
-			fail("want at most %d properties, got %d", *s.MaxProperties, len(x))
-		}
-		for name, val := range x {
-			if p, ok := s.Properties[name]; ok {
-				p.walk(val, append(path, name), problems)
-			} else if s.NoAdditional {
-				fail("unexpected property %q", name)
-			} else if s.Additional != nil {
-				s.Additional.walk(val, append(path, name), problems)
-			}
-		}
-	case []any:
-		if s.MinItems != nil && len(x) < *s.MinItems {
-			fail("want at least %d items, got %d", *s.MinItems, len(x))
-		}
-		if s.MaxItems != nil && len(x) > *s.MaxItems {
-			fail("want at most %d items, got %d", *s.MaxItems, len(x))
-		}
-		if s.UniqueItems {
-			for i := 1; i < len(x); i++ {
-				if j := slices.IndexFunc(x[:i], func(e any) bool { return jsonEqual(e, x[i]) }); j >= 0 {
-					fail("items %d and %d are equal", j, i)
-					break
-				}
-			}
-		}
-		if s.Items != nil {
-			for i, item := range x {
-				s.Items.walk(item, append(path, strconv.Itoa(i)), problems)
-			}
-		}
-	case string:
-		n := utf8.RuneCountInString(x)
-		if s.MinLength != nil && n < *s.MinLength {
-			fail("want at least %d characters, got %d", *s.MinLength, n)
-		}
-		if s.MaxLength != nil && n > *s.MaxLength {
-			fail("want at most %d characters, got %d", *s.MaxLength, n)
-		}
-		if s.Pattern != nil && !s.Pattern.MatchString(x) {
-			fail("does not match %s", s.Pattern)
-		}
-		if valid, ok := schemaFormats[s.Format]; ok && !valid(x) {
-			fail("not a valid %s", s.Format)
-		}
-	case float64:
-		f := x
-		if s.Minimum != nil && f < *s.Minimum {
-			fail("must be >= %v", *s.Minimum)
-		}
-		if s.Maximum != nil && f > *s.Maximum {
-			fail("must be <= %v", *s.Maximum)
-		}
-		if s.ExclusiveMinimum != nil && f <= *s.ExclusiveMinimum {
-			fail("must be > %v", *s.ExclusiveMinimum)
-		}
-		if s.ExclusiveMaximum != nil && f >= *s.ExclusiveMaximum {
-			fail("must be < %v", *s.ExclusiveMaximum)
-		}
-		if m := s.MultipleOf; m != nil {
-			if q := f / *m; math.Abs(q-math.Round(q)) > 1e-9*math.Max(1, math.Abs(q)) {
-				fail("must be a multiple of %v", *m)
-			}
-		}
-	}
-
-	// The combinators apply to the same value. Branches are checked on their
-	// own, so that a failing anyOf branch does not report its problems when
-	// another one passes.
-	for _, sub := range s.AllOf {
-		sub.walk(v, path, problems)
-	}
-	if len(s.AnyOf) > 0 && countMatches(s.AnyOf, v, 1) == 0 {
-		fail("matches none of anyOf")
-	}
-	if len(s.OneOf) > 0 {
-		if n := countMatches(s.OneOf, v, 2); n != 1 {
-			fail("must match exactly one of oneOf, matches %s", map[int]string{0: "none", 2: "several"}[n])
-		}
-	}
-	if s.Not != nil && s.Not.matches(v) {
-		fail("must not match the not schema")
-	}
-	if s.If != nil {
-		if s.If.matches(v) {
-			if s.Then != nil {
-				s.Then.walk(v, path, problems)
-			}
-		} else if s.Else != nil {
-			s.Else.walk(v, path, problems)
-		}
-	}
+	return 0, 0, false
 }
 
-func (s *schema) matches(v any) bool {
-	var problems []string
-	s.walk(v, nil, &problems)
-	return len(problems) == 0
+// pointerToken escapes a property name for a JSON Pointer.
+func pointerToken(name string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(name, "~", "~0"), "/", "~1")
 }
 
-// countMatches returns how many of ss v matches, counting up to limit.
-func countMatches(ss []*schema, v any, limit int) int {
-	n := 0
-	for _, s := range ss {
-		if s.matches(v) {
-			if n++; n == limit {
-				break
-			}
-		}
+// multipleOf reports whether f is a multiple of m, allowing for rounding.
+func multipleOf(f, m float64) bool {
+	q := f / m
+	return math.Abs(q-math.Round(q)) <= 1e-9*math.Max(1, math.Abs(q))
+}
+
+func isDate(s string) bool { _, err := time.Parse(time.DateOnly, s); return err == nil }
+
+func isTime(s string) bool { _, err := time.Parse("15:04:05Z07:00", s); return err == nil }
+
+func isEmail(s string) bool {
+	local, domain, ok := strings.Cut(s, "@")
+	return ok && local != "" && domain != "" && !strings.ContainsAny(domain, "@ ")
+}
+
+func isIPv4(s string) bool { a, err := netip.ParseAddr(s); return err == nil && a.Is4() }
+
+func isIPv6(s string) bool {
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Is6() && a.Zone() == ""
+}
+
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
 	}
-	return n
-}
-
-// jsonIs reports whether a decoded JSON value is of a JSON Schema type.
-func jsonIs(v any, typ string) bool {
-	if typ == "integer" {
-		f, ok := v.(float64)
-		return ok && f == math.Trunc(f)
-	}
-	return jsonTypeOf(v) == typ
-}
-
-func jsonTypeOf(v any) string {
-	switch v.(type) {
-	case map[string]any:
-		return "object"
-	case []any:
-		return "array"
-	case string:
-		return "string"
-	case bool:
-		return "boolean"
-	case float64:
-		return "number"
-	}
-	return "null"
-}
-
-// jsonEqual compares decoded JSON values.
-func jsonEqual(a, b any) bool {
-	switch a := a.(type) {
-	case []any:
-		b, ok := b.([]any)
-		return ok && slices.EqualFunc(a, b, jsonEqual)
-	case map[string]any:
-		b, ok := b.(map[string]any)
-		if !ok || len(a) != len(b) {
-			return false
-		}
-		for k, av := range a {
-			if bv, ok := b[k]; !ok || !jsonEqual(av, bv) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if c != '-' {
 				return false
 			}
+		case '0' <= c && c <= '9', 'a' <= c && c <= 'f', 'A' <= c && c <= 'F':
+		default:
+			return false
 		}
-		return true
 	}
-	return a == b
+	return true
 }
 
-// schemaFormats check the formats the validator enforces.
-var schemaFormats = map[string]func(string) bool{
-	"date":      func(s string) bool { _, err := time.Parse(time.DateOnly, s); return err == nil },
-	"date-time": func(s string) bool { _, err := time.Parse(time.RFC3339, s); return err == nil },
-	"time":      func(s string) bool { _, err := time.Parse("15:04:05Z07:00", s); return err == nil },
-	"email": func(s string) bool {
-		local, domain, ok := strings.Cut(s, "@")
-		return ok && local != "" && domain != "" && !strings.ContainsAny(domain, "@ ")
-	},
-	"ipv4": func(s string) bool { a, err := netip.ParseAddr(s); return err == nil && a.Is4() },
-	"ipv6": func(s string) bool { a, err := netip.ParseAddr(s); return err == nil && a.Is6() && a.Zone() == "" },
-	"uuid": regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString,
+// Code is generated from the AsyncAPI document.
+type Code = string
+
+// validateCode returns a *ValidationError listing how v breaks the constraints
+// of the Code schema, or nil.
+func validateCode(v Code) error {
+	var p violations
+	if !pattern1.MatchString(v) {
+		p.add("/", "does not match %s", pattern1)
+	}
+	return p.err()
+}
+
+// Codes is generated from the AsyncAPI document.
+type Codes = []Code
+
+// validateCodes returns a *ValidationError listing how v breaks the constraints
+// of the Codes schema, or nil.
+func validateCodes(v Codes) error {
+	var p violations
+	if v != nil {
+		if n := len(v); n > 2 {
+			p.add("/", "want at most 2 items, got %d", n)
+		}
+		if i, j, dup := duplicate(v); dup {
+			p.add("/", "items %d and %d are equal", i, j)
+		}
+		for i1, v1 := range v {
+			if err := validateCode(v1); err != nil {
+				p.nest("/"+strconv.Itoa(i1), err)
+			}
+		}
+	}
+	return p.err()
+}
+
+// Color is generated from the AsyncAPI document.
+type Color string
+
+const (
+	ColorRed   Color = "red"
+	ColorGreen Color = "green"
+)
+
+// Validate returns a *ValidationError if v is not one of the Color
+// constants, or nil.
+func (v Color) Validate() error {
+	switch v {
+	case ColorRed, ColorGreen:
+		return nil
+	}
+	return &ValidationError{Problems: []string{"/: must be one of [red green]"}}
 }
 
 // Sample is generated from the AsyncAPI document.
 type Sample struct {
-	ABC       *int64          `json:"a/b~c,omitempty"`
-	AllOf     *string         `json:"allOf,omitempty"`
-	AnyOf     json.RawMessage `json:"anyOf,omitempty"`
-	Bool      *bool           `json:"bool,omitempty"`
-	ConstNull any             `json:"constNull,omitempty"`
-	// Must be map[a:[1 2]].
-	ConstObject any              `json:"constObject,omitempty"`
-	Counts      map[string]int64 `json:"counts,omitempty"`
-	Date        *string          `json:"date,omitempty"`
-	DateTime    *time.Time       `json:"dateTime,omitempty"`
-	Dec         *float64         `json:"dec,omitempty"`
-	Draft4      *float64         `json:"draft4,omitempty"`
-	Email       *string          `json:"email,omitempty"`
-	IfThenElse  any              `json:"ifThenElse,omitempty"`
-	Int         *int64           `json:"int,omitempty"`
-	Ipv4        *string          `json:"ipv4,omitempty"`
-	Ipv6        *string          `json:"ipv6,omitempty"`
-	Not         any              `json:"not,omitempty"`
-	OneOf       json.RawMessage  `json:"oneOf,omitempty"`
-	Str         *string          `json:"str,omitempty"`
-	Tags        []any            `json:"tags,omitempty"`
-	Time        *string          `json:"time,omitempty"`
-	Tree        *Tree            `json:"tree,omitempty"`
-	UUID        *string          `json:"uuid,omitempty"`
-	Values      any              `json:"values,omitempty"`
+	ABC   *int64  `json:"a/b~c,omitempty"`
+	AllOf *string `json:"allOf,omitempty"`
+	Codes *Codes  `json:"codes,omitempty"`
+	Color *Color  `json:"color,omitempty"`
+	// Must be false.
+	ConstFalse *bool `json:"constFalse,omitempty"`
+	// Must be 3.
+	ConstInt *int64 `json:"constInt,omitempty"`
+	// Must be 1.5.
+	ConstNum *float64 `json:"constNum,omitempty"`
+	// Must be "x".
+	ConstStr *string `json:"constStr,omitempty"`
+	// Must be true.
+	ConstTrue *bool            `json:"constTrue,omitempty"`
+	Counts    map[string]int64 `json:"counts,omitempty"`
+	Date      *string          `json:"date,omitempty"`
+	DateTime  *time.Time       `json:"dateTime,omitempty"`
+	Dec       *float64         `json:"dec,omitempty"`
+	Draft4    *float64         `json:"draft4,omitempty"`
+	Email     *string          `json:"email,omitempty"`
+	Float     *float32         `json:"float,omitempty"`
+	Frac      *int64           `json:"frac,omitempty"`
+	Int       *int64           `json:"int,omitempty"`
+	Int32     *int32           `json:"int32,omitempty"`
+	Ipv4      *string          `json:"ipv4,omitempty"`
+	Ipv6      *string          `json:"ipv6,omitempty"`
+	Matrix    [][]int64        `json:"matrix,omitempty"`
+	Max       *string          `json:"max,omitempty"`
+	Min       *string          `json:"min,omitempty"`
+	Str       *string          `json:"str,omitempty"`
+	Tags      []string         `json:"tags"`
+	Time      *string          `json:"time,omitempty"`
+	Tree      *Tree            `json:"tree,omitempty"`
+	UUID      *string          `json:"uuid,omitempty"`
+}
+
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m Sample) Validate() error {
+	var p violations
+	if m.ABC != nil {
+		if *m.ABC < 0 {
+			p.add("/a~1b~0c", "must be >= 0")
+		}
+	}
+	if m.AllOf != nil {
+		if n := utf8.RuneCountInString(*m.AllOf); n < 2 {
+			p.add("/allOf", "want at least 2 characters, got %d", n)
+		}
+	}
+	if m.Codes != nil {
+		if err := validateCodes(*m.Codes); err != nil {
+			p.nest("/codes", err)
+		}
+	}
+	if m.Color != nil {
+		if err := m.Color.Validate(); err != nil {
+			p.nest("/color", err)
+		}
+	}
+	if m.ConstFalse != nil {
+		if *m.ConstFalse {
+			p.add("/constFalse", "must be false")
+		}
+	}
+	if m.ConstInt != nil {
+		if *m.ConstInt != 3 {
+			p.add("/constInt", "must be 3")
+		}
+	}
+	if m.ConstNum != nil {
+		if *m.ConstNum != 1.5 {
+			p.add("/constNum", "must be 1.5")
+		}
+	}
+	if m.ConstStr != nil {
+		if *m.ConstStr != "x" {
+			p.add("/constStr", "must be %q", "x")
+		}
+	}
+	if m.ConstTrue != nil {
+		if !*m.ConstTrue {
+			p.add("/constTrue", "must be true")
+		}
+	}
+	if m.Counts != nil {
+		if n := len(m.Counts); n < 1 {
+			p.add("/counts", "want at least 1 properties, got %d", n)
+		} else if n > 2 {
+			p.add("/counts", "want at most 2 properties, got %d", n)
+		}
+		for k1, v1 := range m.Counts {
+			if v1 < 0 {
+				p.add("/counts/"+pointerToken(k1), "must be >= 0")
+			}
+		}
+	}
+	if m.Date != nil {
+		if !isDate(*m.Date) {
+			p.add("/date", "not a valid date")
+		}
+	}
+	if m.Dec != nil {
+		if *m.Dec <= 0 {
+			p.add("/dec", "must be > 0")
+		}
+		if *m.Dec >= 1 {
+			p.add("/dec", "must be < 1")
+		}
+		if !multipleOf(*m.Dec, 0.1) {
+			p.add("/dec", "must be a multiple of 0.1")
+		}
+	}
+	if m.Draft4 != nil {
+		if *m.Draft4 <= 0 {
+			p.add("/draft4", "must be > 0")
+		}
+		if *m.Draft4 >= 10 {
+			p.add("/draft4", "must be < 10")
+		}
+	}
+	if m.Email != nil {
+		if !isEmail(*m.Email) {
+			p.add("/email", "not a valid email")
+		}
+	}
+	if m.Float != nil {
+		if float64(*m.Float) < 0.5 {
+			p.add("/float", "must be >= 0.5")
+		}
+	}
+	if m.Frac != nil {
+		if float64(*m.Frac) <= 1.5 {
+			p.add("/frac", "must be > 1.5")
+		}
+	}
+	if m.Int != nil {
+		if *m.Int%3 != 0 {
+			p.add("/int", "must be a multiple of 3")
+		}
+	}
+	if m.Int32 != nil {
+		if *m.Int32 < -5 {
+			p.add("/int32", "must be >= -5")
+		}
+		if float64(*m.Int32) > 1000000000000 {
+			p.add("/int32", "must be <= 1000000000000")
+		}
+	}
+	if m.Ipv4 != nil {
+		if !isIPv4(*m.Ipv4) {
+			p.add("/ipv4", "not a valid ipv4")
+		}
+	}
+	if m.Ipv6 != nil {
+		if !isIPv6(*m.Ipv6) {
+			p.add("/ipv6", "not a valid ipv6")
+		}
+	}
+	for i1, v1 := range m.Matrix {
+		for i2, v2 := range v1 {
+			if v2 < 0 {
+				p.add("/matrix/"+strconv.Itoa(i1)+"/"+strconv.Itoa(i2), "must be >= 0")
+			}
+		}
+	}
+	if m.Max != nil {
+		if n := utf8.RuneCountInString(*m.Max); n > 1 {
+			p.add("/max", "want at most 1 characters, got %d", n)
+		}
+	}
+	if m.Min != nil {
+		if n := utf8.RuneCountInString(*m.Min); n < 1 {
+			p.add("/min", "want at least 1 characters, got %d", n)
+		}
+	}
+	if m.Str != nil {
+		if n := utf8.RuneCountInString(*m.Str); n < 2 {
+			p.add("/str", "want at least 2 characters, got %d", n)
+		} else if n > 3 {
+			p.add("/str", "want at most 3 characters, got %d", n)
+		}
+	}
+	if m.Tags == nil {
+		p.add("/", "missing required property %q", "tags")
+	}
+	if m.Tags != nil {
+		if n := len(m.Tags); n < 1 {
+			p.add("/tags", "want at least 1 items, got %d", n)
+		} else if n > 3 {
+			p.add("/tags", "want at most 3 items, got %d", n)
+		}
+		if i, j, dup := duplicate(m.Tags); dup {
+			p.add("/tags", "items %d and %d are equal", i, j)
+		}
+	}
+	if m.Time != nil {
+		if !isTime(*m.Time) {
+			p.add("/time", "not a valid time")
+		}
+	}
+	if m.Tree != nil {
+		if err := m.Tree.Validate(); err != nil {
+			p.nest("/tree", err)
+		}
+	}
+	if m.UUID != nil {
+		if !isUUID(*m.UUID) {
+			p.add("/uuid", "not a valid uuid")
+		}
+	}
+	return p.err()
 }
 
 // Tree is generated from the AsyncAPI document.
@@ -381,145 +564,64 @@ type Tree struct {
 	Value    *int64 `json:"value,omitempty"`
 }
 
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m Tree) Validate() error {
+	var p violations
+	for i1, v1 := range m.Children {
+		if err := v1.Validate(); err != nil {
+			p.nest("/children/"+strconv.Itoa(i1), err)
+		}
+	}
+	if m.Value != nil {
+		if *m.Value < 0 {
+			p.add("/value", "must be >= 0")
+		}
+	}
+	return p.err()
+}
+
 // Channels.
 var (
+	// CodesChannel is the "codes" channel.
+	CodesChannel = Channel[Codes]{
+		Address: "codes",
+	}
 	// SamplesChannel is the "samples" channel.
 	SamplesChannel = Channel[Sample]{
 		Address: "samples",
 	}
 )
 
-// Schemas of the payloads, compiled from the document. A $ref is a pointer
-// to the variable of the schema it refers to.
+// Endpoints of the receive operations: the subject and queue each one
+// subscribes with, e.g. to fill in the FilterSubject and Durable of a
+// JetStream consumer.
 var (
-	schemaSample = &schema{}
-	schemaTree   = &schema{}
+	OnCodesEndpoint = Endpoint{Subject: "codes"}
 )
-
-func init() {
-	*schemaSample = schema{
-		Type: "object",
-		Properties: map[string]*schema{
-			"a/b~c": {Type: "integer"},
-			"allOf": {
-				AllOf: []*schema{
-					{Type: "string"},
-					{MinLength: bound(2)},
-				},
-			},
-			"anyOf": {
-				AnyOf: []*schema{
-					{Type: "string"},
-					{Type: "integer"},
-				},
-			},
-			"bool": {Type: "boolean"},
-			"constNull": {
-				Const:    nil,
-				HasConst: true,
-			},
-			"constObject": {
-				Const:    map[string]any{"a": []any{1.0, 2.0}},
-				HasConst: true,
-			},
-			"counts": {
-				Type:          "object",
-				Additional:    &schema{Type: "integer"},
-				MinProperties: bound(1),
-				MaxProperties: bound(2),
-			},
-			"date": {
-				Type:   "string",
-				Format: "date",
-			},
-			"dateTime": {
-				Type:   "string",
-				Format: "date-time",
-			},
-			"dec": {
-				Type:             "number",
-				ExclusiveMinimum: bound(0.0),
-				ExclusiveMaximum: bound(1.0),
-				MultipleOf:       bound(0.1),
-			},
-			"draft4": {
-				Type:             "number",
-				ExclusiveMinimum: bound(0.0),
-				ExclusiveMaximum: bound(10.0),
-			},
-			"email": {
-				Type:   "string",
-				Format: "email",
-			},
-			"ifThenElse": {
-				If:   &schema{Type: "string"},
-				Then: &schema{MinLength: bound(3)},
-				Else: &schema{Type: "integer"},
-			},
-			"int": {
-				Type:       "integer",
-				MultipleOf: bound(3.0),
-			},
-			"ipv4": {
-				Type:   "string",
-				Format: "ipv4",
-			},
-			"ipv6": {
-				Type:   "string",
-				Format: "ipv6",
-			},
-			"not": {Not: &schema{Type: "string"}},
-			"oneOf": {
-				OneOf: []*schema{
-					{Type: "integer"},
-					{
-						Type:    "number",
-						Minimum: bound(5.0),
-					},
-				},
-			},
-			"str": {
-				Type:      "string",
-				MinLength: bound(2),
-				MaxLength: bound(3),
-			},
-			"tags": {
-				Type:        "array",
-				MinItems:    bound(1),
-				MaxItems:    bound(3),
-				UniqueItems: true,
-			},
-			"time": {
-				Type:   "string",
-				Format: "time",
-			},
-			"tree": schemaTree,
-			"uuid": {
-				Type:   "string",
-				Format: "uuid",
-			},
-			"values": {Enum: []any{1.0, 2.5, "x", true, nil, []any{1.0}, map[string]any{"a": 1.0}}},
-		},
-		NoAdditional:  true,
-		MaxProperties: bound(30),
-	}
-	*schemaTree = schema{
-		Type: "object",
-		Properties: map[string]*schema{
-			"children": {
-				Type:  "array",
-				Items: schemaTree,
-			},
-			"value": {Type: "integer"},
-		},
-	}
-}
 
 // Producer publishes the messages of Validation.
 type Producer struct{ t Publisher }
 
 // NewProducer returns a Producer on top of t.
 func NewProducer(t Publisher) *Producer { return &Producer{t: t} }
+
+// Operation "publishCodes": send on codes.
+// headers may be nil.
+func (c *Producer) PublishCodes(ctx context.Context, headers map[string][]string, msg Codes) error {
+	subject, err := CodesChannel.Subject(nil)
+	if err != nil {
+		return err
+	}
+	if err := validateCodes(msg); err != nil {
+		return fmt.Errorf("Codes: %w", err)
+	}
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal Codes: %w", err)
+	}
+	return c.t.Publish(ctx, subject, headers, body)
+}
 
 // Operation "publishSample": send on samples.
 // headers may be nil.
@@ -528,12 +630,34 @@ func (c *Producer) PublishSample(ctx context.Context, headers map[string][]strin
 	if err != nil {
 		return err
 	}
+	if err := msg.Validate(); err != nil {
+		return fmt.Errorf("Sample: %w", err)
+	}
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal Sample: %w", err)
 	}
-	if err := schemaSample.validate(body); err != nil {
-		return fmt.Errorf("Sample: %w", err)
-	}
 	return c.t.Publish(ctx, subject, headers, body)
+}
+
+// Consumer subscribes to the messages of Validation.
+type Consumer struct{ t Subscriber }
+
+// NewConsumer returns a Consumer on top of t.
+func NewConsumer(t Subscriber) *Consumer { return &Consumer{t: t} }
+
+// Operation "onCodes": receive on codes.
+//
+// h returning nil acks the message, an error naks it, and an error made with
+// Terminate terminates it. Malformed messages, including those whose payload
+// does not validate, are terminated without calling h.
+func (c *Consumer) OnCodes(h func(ctx context.Context, m Received[Codes]) error) (Subscription, error) {
+	return c.t.Subscribe(OnCodesEndpoint.Subject, OnCodesEndpoint.Queue,
+		func(ctx context.Context, msg Inbox) (Settlement, error) {
+			r, err := decode(CodesChannel, validateCodes, msg)
+			if err != nil {
+				return Term, err
+			}
+			return settle(h(ctx, r))
+		})
 }

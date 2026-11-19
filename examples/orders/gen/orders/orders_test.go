@@ -457,6 +457,7 @@ func TestProducerValidates(t *testing.T) {
 	valid := []func(*orders.Order){
 		func(*orders.Order) {},
 		func(o *orders.Order) { o.Status, o.ShippedAt = orders.OrderStatusShipped, &shippedAt },
+		func(o *orders.Order) { o.Status = orders.OrderStatusShipped },
 		func(o *orders.Order) { o.CustomerEmail, o.Total = &email, &total },
 		func(o *orders.Order) { o.Items[0].Quantity = 1000 },
 		func(o *orders.Order) { o.Metadata = map[string]string{"k": "v"} },
@@ -481,16 +482,15 @@ func TestProducerValidates(t *testing.T) {
 		change func(*orders.Order)
 		want   string
 	}{
-		"empty id":           {func(o *orders.Order) { o.ID = "" }, "/id: want at least 1 characters, got 0"},
-		"no items":           {func(o *orders.Order) { o.Items = nil }, "/items: want array, got null"},
-		"empty items":        {func(o *orders.Order) { o.Items = []orders.LineItem{} }, "/items: want at least 1 items, got 0"},
-		"unknown status":     {func(o *orders.Order) { o.Status = "lost" }, "/status: must be one of [pending paid shipped cancelled]"},
-		"sku pattern":        {func(o *orders.Order) { o.Items[0].SKU = "abc-1" }, "/items/0/sku: does not match ^[A-Z]{3}-[0-9]+$"},
-		"quantity minimum":   {func(o *orders.Order) { o.Items[0].Quantity = 0 }, "/items/0/quantity: must be >= 1"},
-		"quantity maximum":   {func(o *orders.Order) { o.Items[0].Quantity = 1001 }, "/items/0/quantity: must be <= 1000"},
-		"negative total":     {func(o *orders.Order) { o.Total = &negative }, "/total: must be >= 0"},
-		"email format":       {func(o *orders.Order) { o.CustomerEmail = &bad }, "/customerEmail: not a valid email"},
-		"shipped needs date": {func(o *orders.Order) { o.Status = orders.OrderStatusShipped }, `/: missing required property "shippedAt"`},
+		"empty id":         {func(o *orders.Order) { o.ID = "" }, "/id: want at least 1 characters, got 0"},
+		"no items":         {func(o *orders.Order) { o.Items = nil }, `/: missing required property "items"`},
+		"empty items":      {func(o *orders.Order) { o.Items = []orders.LineItem{} }, "/items: want at least 1 items, got 0"},
+		"unknown status":   {func(o *orders.Order) { o.Status = "lost" }, "/status: must be one of [pending paid shipped cancelled]"},
+		"sku pattern":      {func(o *orders.Order) { o.Items[0].SKU = "abc-1" }, "/items/0/sku: does not match ^[A-Z]{3}-[0-9]+$"},
+		"quantity minimum": {func(o *orders.Order) { o.Items[0].Quantity = 0 }, "/items/0/quantity: must be >= 1"},
+		"quantity maximum": {func(o *orders.Order) { o.Items[0].Quantity = 1001 }, "/items/0/quantity: must be <= 1000"},
+		"negative total":   {func(o *orders.Order) { o.Total = &negative }, "/total: must be >= 0"},
+		"email format":     {func(o *orders.Order) { o.CustomerEmail = &bad }, "/customerEmail: not a valid email"},
 		"recursive schema": {func(o *orders.Order) {
 			o.Category = &orders.Category{Name: "a", Children: []orders.Category{{Name: "b", Children: []orders.Category{{Name: ""}}}}}
 		}, "/category/children/0/children/0/name: want at least 1 characters, got 0"},
@@ -524,8 +524,9 @@ func TestProducerValidates(t *testing.T) {
 	}
 }
 
-// TestConsumerTerminatesInvalidMessages checks that a received message that
-// does not match its schema is terminated without calling the handler.
+// TestConsumerTerminatesInvalidMessages checks that a received message whose
+// payload does not validate, or does not decode, is terminated without
+// calling the handler.
 func TestConsumerTerminatesInvalidMessages(t *testing.T) {
 	r := &recorder{}
 	called := 0
@@ -537,28 +538,66 @@ func TestConsumerTerminatesInvalidMessages(t *testing.T) {
 	}
 	for _, body := range []string{
 		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"category":{"name":"a","children":[{"name":"b"}]}}`,
-		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"category":{"name":"a","children":[{"name":"b","x":1}]}}`,
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"category":{"name":"a","children":[{"name":""}]}}`,
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":0}]}`,
+		`{"id":"o-1","status":"lost","items":[{"sku":"ABC-1","quantity":1}]}`,
+		`{"id":"o-1","status":"paid"}`,
+	} {
+		r.deliver("orders.eu.created", body)
+	}
+	for _, body := range []string{
 		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1.5}]}`,
 		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"metadata":{"k":1}}`,
 		`{"id":"o-1","status":"shipped","items":[{"sku":"ABC-1","quantity":1}],"shippedAt":"yesterday"}`,
 	} {
 		r.deliver("orders.eu.created", body)
 	}
-	want := []orders.Settlement{orders.Ack, orders.Term, orders.Term, orders.Term, orders.Term}
+	want := []orders.Settlement{orders.Ack, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term}
 	if !slices.Equal(r.settled, want) || called != 1 {
 		t.Fatalf("settled = %v, handler called %d times; want %v, once", r.settled, called, want)
 	}
 	for i, problem := range []string{
-		`/category/children/0: unexpected property "x"`,
-		"/items/0/quantity: want integer, got number",
-		"/metadata/k: want string, got number",
-		"/shippedAt: not a valid date-time",
+		"/category/children/0/name: want at least 1 characters, got 0",
+		"/items/0/quantity: must be >= 1",
+		"/status: must be one of [pending paid shipped cancelled]",
+		`/: missing required property "items"`,
 	} {
 		err := r.errs[i+1]
 		var verr *orders.ValidationError
 		if !broker.IsMalformed(err) || !errors.As(err, &verr) || !slices.Contains(verr.Problems, problem) {
 			t.Errorf("delivery %d: err = %v, want a malformed ValidationError with %q", i+1, err, problem)
 		}
+	}
+	for i := 5; i < 8; i++ {
+		err := r.errs[i]
+		var verr *orders.ValidationError
+		if !broker.IsMalformed(err) || errors.As(err, &verr) || !strings.Contains(err.Error(), "orders.eu.created: decode: ") {
+			t.Errorf("delivery %d: err = %v, want a malformed decode error", i, err)
+		}
+	}
+}
+
+// TestValidate checks the Validate methods directly.
+func TestValidate(t *testing.T) {
+	if err := validOrder("o-1").Validate(); err != nil {
+		t.Errorf("valid order: %v", err)
+	}
+	if err := orders.OrderStatusShipped.Validate(); err != nil {
+		t.Errorf("valid status: %v", err)
+	}
+	err := orders.OrderStatus("lost").Validate()
+	var verr *orders.ValidationError
+	if !errors.As(err, &verr) || !slices.Equal(verr.Problems, []string{"/: must be one of [pending paid shipped cancelled]"}) {
+		t.Errorf("invalid status: err = %v", err)
+	}
+	err = orders.Order{}.Validate()
+	want := []string{
+		`/: missing required property "items"`,
+		"/id: want at least 1 characters, got 0",
+		"/status: must be one of [pending paid shipped cancelled]",
+	}
+	if !errors.As(err, &verr) || !slices.Equal(verr.Problems, want) {
+		t.Errorf("empty order: err = %v, want %q", err, want)
 	}
 }
 

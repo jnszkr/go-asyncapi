@@ -129,14 +129,6 @@ components:
           type: object
           additionalProperties:
             type: string
-      # A shipped order says when it shipped.
-      if:
-        required: [status]
-        properties:
-          status:
-            const: shipped
-      then:
-        required: [shippedAt]
     LineItem:
       type: object
       required: [sku, quantity]
@@ -153,7 +145,6 @@ components:
       type: object
       description: A product category; categories nest.
       required: [name]
-      additionalProperties: false
       properties:
         name:
           type: string

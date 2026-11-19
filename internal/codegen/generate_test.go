@@ -600,7 +600,9 @@ func TestRuntimeNameClash(t *testing.T) {
 			if got := err != nil && strings.Contains(err.Error(), "clashes with the generated "+name); got != want {
 				t.Errorf("%s with a type %s: err = %v, want a clash: %v", part, name, err, want)
 			}
-			if _, err := Generate(doc, Options{Package: "p", Parts: []Part{PartModels}}); err != nil {
+			// The Validate methods of the models need ValidationError.
+			_, err = Generate(doc, Options{Package: "p", Parts: []Part{PartModels}})
+			if clash := err != nil && strings.Contains(err.Error(), "clashes with the generated ValidationError"); (err != nil) != (name == "ValidationError") || (err != nil && !clash) {
 				t.Errorf("models with a type %s: %v", name, err)
 			}
 		}

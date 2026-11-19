@@ -23,12 +23,12 @@ type model struct {
 	Channels []*channel
 	Ops      []*operation
 	APIs     []*apiType
-	// Schemas are the compiled schemas of the payloads the operations send
-	// and receive.
-	Schemas []*schemaVar
-
-	doc  *spec.Document
-	warn func(format string, args ...any)
+	// Validates says whether the types have Validate methods or functions,
+	// which need the ValidationError runtime. Helpers are the helper
+	// functions they call, and Patterns their compiled regular expressions.
+	Validates bool
+	Helpers   map[string]bool
+	Patterns  []pattern
 }
 
 // apiType is a generated type holding the operations of one Part.
@@ -95,11 +95,20 @@ type message struct {
 	Name        string
 	Type        string // Go payload type
 	ContentType string
-	// Schema is the variable holding the compiled payload schema, or "" for
-	// a message without a payload.
-	Schema string
+	// Validator is a func(Type) error validating payloads, or "" if
+	// nothing constrains them.
+	Validator string
+}
 
-	payload *spec.Schema
+// Check returns the expression validating the payload arg, or "".
+func (m *message) Check(arg string) string {
+	if name, ok := strings.CutSuffix(m.Validator, ".Validate"); ok && name != "" {
+		return arg + ".Validate()"
+	}
+	if m.Validator == "" {
+		return ""
+	}
+	return m.Validator + "(" + arg + ")"
 }
 
 // headerDecl lists the header names of a message as constants.
@@ -193,27 +202,6 @@ func (m *model) selectParts(parts []Part) error {
 	return nil
 }
 
-// compileSchemas compiles the payload schemas of the selected operations.
-func (m *model) compileSchemas() error {
-	ss := newSchemaSet(m.doc, m.warn)
-	done := map[*message]bool{}
-	for _, o := range m.Ops {
-		for _, msg := range []*message{o.Message, o.Reply} {
-			if msg == nil || done[msg] {
-				continue
-			}
-			done[msg] = true
-			var err error
-			if msg.Schema, err = ss.payload(msg.payload, msg.Name); err != nil {
-				return fmt.Errorf("message %s payload: %w", msg.Name, err)
-			}
-		}
-	}
-	slices.SortFunc(ss.vars, func(a, b *schemaVar) int { return strings.Compare(a.Name, b.Name) })
-	m.Schemas = ss.vars
-	return nil
-}
-
 // Has reports whether the generated type of part is generated.
 func (m *model) Has(part Part) bool {
 	return slices.ContainsFunc(m.Ops, func(o *operation) bool { return o.Part() == part })
@@ -222,10 +210,14 @@ func (m *model) Has(part Part) bool {
 // runtimeNames are the top-level names the template declares besides those
 // derived from the document, for the selected parts.
 func (m *model) runtimeNames() []string {
-	if len(m.Ops) == 0 {
-		return nil
+	var names []string
+	if m.Validates {
+		names = append(names, "ValidationError")
 	}
-	names := []string{"Params", "Channel", "ValidationError"}
+	if len(m.Ops) == 0 {
+		return names
+	}
+	names = append(names, "Params", "Channel")
 	if m.HasReceive() {
 		names = append(names, "Endpoint", "Received", "Inbox", "Subscription", "MalformedError")
 	}
@@ -261,7 +253,7 @@ func buildModel(doc *spec.Document, pkg string, warn func(string)) (*model, erro
 		messages: map[string]*message{},
 		msgNames: map[string]bool{},
 	}
-	m := &model{Package: pkg, Title: doc.Info.Title, Version: doc.Info.Version, doc: doc, warn: b.types.warn}
+	m := &model{Package: pkg, Title: doc.Info.Title, Version: doc.Info.Version}
 
 	opKeys := sortedKeys(doc.Operations)
 	opNames := map[string]string{}
@@ -288,6 +280,19 @@ func buildModel(doc *spec.Document, pkg string, warn func(string)) (*model, erro
 	}
 	slices.SortFunc(b.types.decls, func(a, b *typeDecl) int { return strings.Compare(a.Name, b.Name) })
 	breakRecursion(b.types.decls)
+	vs := newValidators(b.types)
+	if err := vs.run(); err != nil {
+		return nil, err
+	}
+	for _, msg := range b.messages {
+		msg.Validator = vs.funcExpr(msg.Type)
+	}
+	if m.Validates = vs.generates(); m.Validates {
+		for _, imp := range []string{"fmt", "slices", "strings"} {
+			b.types.imports[imp] = true
+		}
+	}
+	m.Helpers, m.Patterns = vs.helpers, vs.patterns
 	m.Types = b.types.decls
 	m.Headers = b.headers
 	for imp := range b.types.imports {
@@ -394,7 +399,7 @@ func (b *builder) message(ref string) (*message, error) {
 		name = msg.Name
 	}
 	goName := b.messageName(canonical, name)
-	m := &message{Name: goName, ContentType: firstNonEmpty(msg.ContentType, b.doc.DefaultContentType, "application/json"), payload: msg.Payload}
+	m := &message{Name: goName, ContentType: firstNonEmpty(msg.ContentType, b.doc.DefaultContentType, "application/json")}
 	if !isJSON(m.ContentType) {
 		b.types.warn("message %q: content type %q is not supported: payloads are encoded as JSON", name, m.ContentType)
 	}

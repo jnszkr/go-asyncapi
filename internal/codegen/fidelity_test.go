@@ -293,7 +293,6 @@ func TestConstIsTypedAndDocumented(t *testing.T) {
 func TestSupportedDocumentsDoNotWarn(t *testing.T) {
 	for _, payload := range []string{
 		`{type: object, properties: {a: {type: string}}, additionalProperties: true}`,
-		`{type: object, properties: {a: {type: string}}, additionalProperties: false}`,
 		`{type: object, additionalProperties: {type: integer}}`,
 		`{type: object, additionalProperties: {}}`,
 		`{type: object, properties: {a: {}}, additionalProperties: {}}`,

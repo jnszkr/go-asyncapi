@@ -1,161 +1,28 @@
 package codegen
 
 import (
-	"fmt"
-	"maps"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/jnszkr/go-asyncapi/internal/spec"
-	"gopkg.in/yaml.v3"
 )
 
-const componentB = `
-components:
-  schemas:
-    B: {type: integer}
-    A: {$ref: '#/components/schemas/B'}
-    Node: {properties: {next: {$ref: '#/components/schemas/Node'}}}
-    M: {type: string}
-    Bad: {multipleOf: 0}
-`
-
-// compileSchema compiles payload, a schema in YAML or "" for none, as the
-// payload of a message named M, next to the components of componentB.
-func compileSchema(t *testing.T, payload string) (name string, literals map[string]string, warnings []string, err error) {
+// models builds the model of src and returns its types by name, with the
+// warnings.
+func models(t *testing.T, src string) (map[string]*typeDecl, *model, []string, error) {
 	t.Helper()
-	doc, err := spec.Parse([]byte(head + componentB))
+	doc := mustParse(t, src)
+	var warnings []string
+	m, err := buildModel(doc, "p", func(w string) { warnings = append(warnings, w) })
 	if err != nil {
-		t.Fatal(err)
+		return nil, nil, warnings, err
 	}
-	var s *spec.Schema
-	if payload != "" {
-		s = new(spec.Schema)
-		if err := yaml.Unmarshal([]byte(payload), s); err != nil {
-			t.Fatal(err)
-		}
+	byName := map[string]*typeDecl{}
+	for _, d := range m.Types {
+		byName[d.Name] = d
 	}
-	ss := newSchemaSet(doc, func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) })
-	name, err = ss.payload(s, "M")
-	literals = map[string]string{}
-	for _, v := range ss.vars {
-		literals[v.Name] = v.Literal
-	}
-	return name, literals, warnings, err
-}
-
-func TestSchemaLiterals(t *testing.T) {
-	tests := []struct{ payload, want string }{
-		{`{}`, `schema{}`},
-		{`{type: string}`, `schema{Type: "string"}`},
-		{`{title: t, description: d, examples: [1], default: 1}`, `schema{}`},
-		{`{enum: [a, 1, 1.5, true, null, [1], {k: v, a: 2}]}`, `schema{Enum: []any{"a", 1.0, 1.5, true, nil, []any{1.0}, map[string]any{"a": 2.0, "k": "v"}}}`},
-		{`{enum: []}`, `schema{Enum: []any{}}`},
-		{`{const: 0}`, "schema{\nConst: 0.0,\nHasConst: true,\n}"},
-		{`{const: null}`, "schema{\nConst: nil,\nHasConst: true,\n}"},
-		{`{required: [a, b]}`, `schema{Required: []string{"a", "b"}}`},
-		{`{properties: {b: {}, a: {type: string}}}`, "schema{\nProperties: map[string]*schema{\n\"a\": {Type: \"string\"},\n\"b\": {},\n},\n}"},
-		{`{properties: {b: {$ref: '#/components/schemas/B'}}}`, "schema{\nProperties: map[string]*schema{\n\"b\": schemaB,\n},\n}"},
-		{`{additionalProperties: false}`, `schema{NoAdditional: true}`},
-		{`{additionalProperties: true}`, `schema{}`},
-		{`{additionalProperties: {}}`, `schema{}`},
-		{`{additionalProperties: {type: integer}}`, `schema{Additional: &schema{Type: "integer"}}`},
-		{`{additionalProperties: {$ref: '#/components/schemas/B'}}`, `schema{Additional: schemaB}`},
-		{`{minProperties: 1}`, `schema{MinProperties: bound(1)}`},
-		{`{maxProperties: 0}`, `schema{MaxProperties: bound(0)}`},
-		{`{items: {type: string}}`, `schema{Items: &schema{Type: "string"}}`},
-		{`{minItems: 1}`, `schema{MinItems: bound(1)}`},
-		{`{maxItems: 2}`, `schema{MaxItems: bound(2)}`},
-		{`{uniqueItems: true}`, `schema{UniqueItems: true}`},
-		{`{uniqueItems: false}`, `schema{}`},
-		{`{minLength: 2}`, `schema{MinLength: bound(2)}`},
-		{`{maxLength: 3}`, `schema{MaxLength: bound(3)}`},
-		{`{pattern: '^a\d$'}`, `schema{Pattern: regexp.MustCompile("^a\\d$")}`},
-		{`{format: int32}`, `schema{}`},
-		{`{minimum: 1}`, `schema{Minimum: bound(1.0)}`},
-		{`{minimum: -0.5}`, `schema{Minimum: bound(-0.5)}`},
-		{`{minimum: 1e21}`, `schema{Minimum: bound(1e+21)}`},
-		{`{maximum: 2}`, `schema{Maximum: bound(2.0)}`},
-		{`{exclusiveMinimum: 2}`, `schema{ExclusiveMinimum: bound(2.0)}`},
-		{`{exclusiveMaximum: 2.5}`, `schema{ExclusiveMaximum: bound(2.5)}`},
-		{`{minimum: 1, exclusiveMinimum: true}`, `schema{ExclusiveMinimum: bound(1.0)}`},
-		{`{maximum: 1, exclusiveMaximum: true}`, `schema{ExclusiveMaximum: bound(1.0)}`},
-		{`{minimum: 1, exclusiveMinimum: false}`, `schema{Minimum: bound(1.0)}`},
-		{`{maximum: 1, exclusiveMaximum: false}`, `schema{Maximum: bound(1.0)}`},
-		{`{multipleOf: 3}`, `schema{MultipleOf: bound(3.0)}`},
-		{`{allOf: [{type: string}, {$ref: '#/components/schemas/B'}]}`, "schema{\nAllOf: []*schema{\n{Type: \"string\"},\nschemaB,\n},\n}"},
-		{`{anyOf: [{}]}`, "schema{\nAnyOf: []*schema{\n{},\n},\n}"},
-		{`{oneOf: [{}]}`, "schema{\nOneOf: []*schema{\n{},\n},\n}"},
-		{`{not: {type: string}}`, `schema{Not: &schema{Type: "string"}}`},
-		{`{if: {}, then: {type: string}, else: {$ref: '#/components/schemas/B'}}`, "schema{\nIf: &schema{},\nThen: &schema{Type: \"string\"},\nElse: schemaB,\n}"},
-		{`{type: object, required: [a], minLength: 1}`, "schema{\nType: \"object\",\nRequired: []string{\"a\"},\nMinLength: bound(1),\n}"},
-	}
-	for _, f := range enforcedFormats {
-		tests = append(tests, struct{ payload, want string }{`{format: ` + f + `}`, `schema{Format: "` + f + `"}`})
-	}
-	for _, tt := range tests {
-		name, literals, warnings, err := compileSchema(t, tt.payload)
-		if err != nil {
-			t.Errorf("%s: %v", tt.payload, err)
-			continue
-		}
-		if name != "schemaM" || literals["schemaM"] != tt.want {
-			t.Errorf("%s: %s = %s\nwant %s", tt.payload, name, literals["schemaM"], tt.want)
-		}
-		if len(warnings) != 0 {
-			t.Errorf("%s: unexpected warnings %q", tt.payload, warnings)
-		}
-	}
-}
-
-func TestSchemaRefs(t *testing.T) {
-	name, literals, _, err := compileSchema(t, `{$ref: '#/components/schemas/A'}`)
-	if err != nil || name != "schemaB" || len(literals) != 1 || literals["schemaB"] != `schema{Type: "integer"}` {
-		t.Errorf("ref chain: %s, %q, %v", name, literals, err)
-	}
-
-	name, literals, _, err = compileSchema(t, `{$ref: '#/components/schemas/Node'}`)
-	if err != nil || name != "schemaNode" || len(literals) != 1 ||
-		literals["schemaNode"] != "schema{\nProperties: map[string]*schema{\n\"next\": schemaNode,\n},\n}" {
-		t.Errorf("recursive: %s, %q, %v", name, literals, err)
-	}
-
-	// A $ref to a schema outside components gets a variable too, as does the
-	// schema a chain of refs ends at, and names stay unique.
-	name, literals, _, err = compileSchema(t, `{properties: {a: {$ref: '#/components/schemas/M'}, b: {$ref: '#/components/schemas/Node/properties/next'}, c: {$ref: '#/components/schemas/Node/properties'}}}`)
-	want := map[string]string{
-		"schemaM":          "schema{\nProperties: map[string]*schema{\n\"a\": schemaM2,\n\"b\": schemaNode,\n\"c\": schemaProperties,\n},\n}",
-		"schemaM2":         `schema{Type: "string"}`,
-		"schemaNode":       "schema{\nProperties: map[string]*schema{\n\"next\": schemaNode,\n},\n}",
-		"schemaProperties": "schema{}",
-	}
-	if err != nil || name != "schemaM" || !maps.Equal(literals, want) {
-		t.Errorf("names: %s, %q, %v", name, literals, err)
-	}
-
-	// The variable is reused however often the schema is referred to.
-	ss := newSchemaSet(mustParse(t, head+componentB), func(string, ...any) {})
-	for range 2 {
-		for _, ref := range []string{"#/components/schemas/B", "#/components/schemas/A"} {
-			if got, err := ss.payload(&spec.Schema{Ref: ref}, "M"); err != nil || got != "schemaB" {
-				t.Errorf("payload(%s) = %s, %v", ref, got, err)
-			}
-		}
-	}
-	if len(ss.vars) != 1 {
-		t.Errorf("vars = %d, want 1", len(ss.vars))
-	}
-
-	if name, literals, _, err := compileSchema(t, ""); err != nil || name != "" || len(literals) != 0 {
-		t.Errorf("no payload: %q, %q, %v", name, literals, err)
-	}
-	if name, literals, _, err := compileSchema(t, `{schemaFormat: application/schema+json;version=draft-07, schema: {type: string}}`); err != nil || name != "schemaM" || literals[name] != `schema{Type: "string"}` {
-		t.Errorf("multi format: %q, %q, %v", name, literals, err)
-	}
-	if name, _, _, err := compileSchema(t, `{schemaFormat: application/schema+json;version=draft-07, schema: {$ref: '#/components/schemas/B'}}`); err != nil || name != "schemaB" {
-		t.Errorf("multi format ref: %q, %v", name, err)
-	}
+	return byName, m, warnings, nil
 }
 
 func mustParse(t *testing.T, src string) *spec.Document {
@@ -167,28 +34,255 @@ func mustParse(t *testing.T, src string) *spec.Document {
 	return doc
 }
 
-func TestSchemaWarnings(t *testing.T) {
-	tests := []struct{ payload, want, literal string }{
-		{`{format: uri}`, `M: format "uri" is not enforced`, `schema{}`},
-		{`{pattern: '(?=a)'}`, `M: pattern "(?=a)" is not enforced: Go's regexp package does not support it`, `schema{}`},
-		{`{properties: {a: {format: uri}}}`, `M/properties/a: format "uri" is not enforced`, ""},
-		{`{items: {format: uri}}`, `M/items: format "uri" is not enforced`, ""},
-		{`{additionalProperties: {format: uri}}`, `M/additionalProperties: format "uri" is not enforced`, ""},
-		{`{allOf: [{}, {format: uri}]}`, `M/allOf/1: format "uri" is not enforced`, ""},
-		{`{anyOf: [{format: uri}]}`, `M/anyOf/0: format "uri" is not enforced`, ""},
-		{`{oneOf: [{format: uri}]}`, `M/oneOf/0: format "uri" is not enforced`, ""},
-		{`{not: {format: uri}}`, `M/not: format "uri" is not enforced`, ""},
-		{`{if: {format: uri}}`, `M/if: format "uri" is not enforced`, ""},
-		{`{then: {format: uri}}`, `M/then: format "uri" is not enforced`, ""},
-		{`{else: {format: uri}}`, `M/else: format "uri" is not enforced`, ""},
-		{`{patternProperties: {a: {}}, additionalProperties: false}`, `M: additionalProperties next to patternProperties is not enforced`, `schema{}`},
-		{`{patternProperties: {a: {}}, additionalProperties: {type: string}}`, `M: additionalProperties next to patternProperties is not enforced`, `schema{}`},
+// checks returns the checks generated for the payload M of payloadDoc,
+// followed by more of the document.
+func checks(t *testing.T, payload string, more ...string) string {
+	t.Helper()
+	decls, _, warnings, err := models(t, payloadDoc(payload)+strings.Join(more, ""))
+	if err != nil {
+		t.Fatalf("%s: %v", payload, err)
 	}
-	for _, kw := range unenforcedKeywords {
-		tests = append(tests, struct{ payload, want, literal string }{`{` + kw + `: {}}`, `M: ` + kw + ` is not enforced`, `schema{}`})
+	if len(warnings) > 0 {
+		t.Errorf("%s: unexpected warnings %q", payload, warnings)
+	}
+	return strings.Join(decls["M"].Checks, "\n")
+}
+
+// fails is the code of a check of value v that adds a problem at "/".
+func fails(cond, problem string) string {
+	return "if " + cond + " {\np.add(\"/\", " + problem + ")\n}"
+}
+
+func TestScalarChecks(t *testing.T) {
+	tests := []struct{ payload, want string }{
+		{`{type: string}`, ""},
+		{`{type: string, minLength: 1}`, "if n := utf8.RuneCountInString(v); n < 1 {\np.add(\"/\", \"want at least 1 characters, got %d\", n)\n}"},
+		{`{type: string, maxLength: 3}`, "if n := utf8.RuneCountInString(v); n > 3 {\np.add(\"/\", \"want at most 3 characters, got %d\", n)\n}"},
+		{`{type: string, minLength: 1, maxLength: 3}`, "if n := utf8.RuneCountInString(v); n < 1 {\np.add(\"/\", \"want at least 1 characters, got %d\", n)\n} else if n > 3 {\np.add(\"/\", \"want at most 3 characters, got %d\", n)\n}"},
+		{`{type: string, pattern: '^a\d$'}`, fails("!pattern1.MatchString(v)", `"does not match %s", pattern1`)},
+		{`{type: string, format: date}`, fails("!isDate(v)", `"not a valid date"`)},
+		{`{type: string, format: time}`, fails("!isTime(v)", `"not a valid time"`)},
+		{`{type: string, format: email}`, fails("!isEmail(v)", `"not a valid email"`)},
+		{`{type: string, format: ipv4}`, fails("!isIPv4(v)", `"not a valid ipv4"`)},
+		{`{type: string, format: ipv6}`, fails("!isIPv6(v)", `"not a valid ipv6"`)},
+		{`{type: string, format: uuid}`, fails("!isUUID(v)", `"not a valid uuid"`)},
+		{`{type: string, format: password}`, ""},
+		{`{const: a}`, fails(`v != "a"`, `"must be %q", "a"`)},
+		{`{type: integer, minimum: 1}`, fails("v < 1", `"must be >= 1"`)},
+		{`{type: integer, maximum: 1}`, fails("v > 1", `"must be <= 1"`)},
+		{`{type: integer, exclusiveMinimum: 1}`, fails("v <= 1", `"must be > 1"`)},
+		{`{type: integer, exclusiveMaximum: 1}`, fails("v >= 1", `"must be < 1"`)},
+		{`{type: integer, minimum: 1, exclusiveMinimum: true}`, fails("v <= 1", `"must be > 1"`)},
+		{`{type: integer, maximum: 1, exclusiveMaximum: true}`, fails("v >= 1", `"must be < 1"`)},
+		{`{type: integer, minimum: 1, exclusiveMinimum: false}`, fails("v < 1", `"must be >= 1"`)},
+		{`{type: integer, minimum: 1.5}`, fails("float64(v) < 1.5", `"must be >= 1.5"`)},
+		{`{type: integer, minimum: -1e21}`, fails("float64(v) < -1e+21", `"must be >= -1e+21"`)},
+		{`{type: integer, minimum: 1e6}`, fails("v < 1000000", `"must be >= 1000000"`)},
+		{`{type: number, minimum: 1.5e-7}`, fails("v < 1.5e-07", `"must be >= 1.5e-07"`)},
+		{`{type: integer, maximum: 9223372036854775807}`, fails("float64(v) > 9223372036854775808", `"must be <= 9223372036854775808"`)},
+		{`{type: integer, minimum: -9223372036854775808}`, fails("v < -9223372036854775808", `"must be >= -9223372036854775808"`)},
+		{`{type: integer, format: int32, maximum: 2147483647}`, fails("v > 2147483647", `"must be <= 2147483647"`)},
+		{`{type: integer, format: int32, maximum: 2147483648}`, fails("float64(v) > 2147483648", `"must be <= 2147483648"`)},
+		{`{type: integer, format: int32, minimum: -2147483648}`, fails("v < -2147483648", `"must be >= -2147483648"`)},
+		{`{type: integer, format: int32, minimum: -2147483649}`, fails("float64(v) < -2147483649", `"must be >= -2147483649"`)},
+		{`{type: number, minimum: 0.5}`, fails("v < 0.5", `"must be >= 0.5"`)},
+		{`{type: number, format: float, minimum: 0.5}`, fails("float64(v) < 0.5", `"must be >= 0.5"`)},
+		{`{type: integer, multipleOf: 3}`, fails("v%3 != 0", `"must be a multiple of 3"`)},
+		{`{type: integer, multipleOf: 0.5}`, fails("!multipleOf(float64(v), 0.5)", `"must be a multiple of 0.5"`)},
+		{`{type: number, multipleOf: 3}`, fails("!multipleOf(v, 3)", `"must be a multiple of 3"`)},
+		{`{type: number, format: float, multipleOf: 3}`, fails("!multipleOf(float64(v), 3)", `"must be a multiple of 3"`)},
+		{`{type: integer, const: 3}`, fails("v != 3", `"must be 3"`)},
+		{`{type: number, const: 1.5}`, fails("v != 1.5", `"must be 1.5"`)},
+		{`{const: true}`, fails("!v", `"must be true"`)},
+		{`{const: false}`, fails("v", `"must be false"`)},
+		{`{type: integer, minimum: 1, maximum: 9}`, fails("v < 1", `"must be >= 1"`) + "\n" + fails("v > 9", `"must be <= 9"`)},
+		{`{allOf: [{type: string}, {minLength: 2}]}`, "if n := utf8.RuneCountInString(v); n < 2 {\np.add(\"/\", \"want at least 2 characters, got %d\", n)\n}"},
 	}
 	for _, tt := range tests {
-		_, literals, warnings, err := compileSchema(t, tt.payload)
+		if got := checks(t, tt.payload); got != tt.want {
+			t.Errorf("%s:\n%s\nwant\n%s", tt.payload, got, tt.want)
+		}
+	}
+}
+
+func TestCollectionChecks(t *testing.T) {
+	tests := []struct{ payload, want string }{
+		{`{type: array, items: {type: string}}`, ""},
+		{`{type: array, minItems: 1}`, "if v != nil {\nif n := len(v); n < 1 {\np.add(\"/\", \"want at least 1 items, got %d\", n)\n}\n}"},
+		{`{type: array, maxItems: 2}`, "if v != nil {\nif n := len(v); n > 2 {\np.add(\"/\", \"want at most 2 items, got %d\", n)\n}\n}"},
+		{`{type: array, uniqueItems: true, items: {type: integer}}`, "if v != nil {\nif i, j, dup := duplicate(v); dup {\np.add(\"/\", \"items %d and %d are equal\", i, j)\n}\n}"},
+		{`{type: array, uniqueItems: false, items: {type: integer}}`, ""},
+		{`{type: array, items: {type: string, minLength: 1}}`, "for i1, v1 := range v {\nif n := utf8.RuneCountInString(v1); n < 1 {\np.add(\"/\"+strconv.Itoa(i1), \"want at least 1 characters, got %d\", n)\n}\n}"},
+		{`{type: array, items: {type: array, items: {type: integer, minimum: 0}}}`, "for i1, v1 := range v {\nfor i2, v2 := range v1 {\nif v2 < 0 {\np.add(\"/\"+strconv.Itoa(i1)+\"/\"+strconv.Itoa(i2), \"must be >= 0\")\n}\n}\n}"},
+		{`{type: object, minProperties: 1}`, "if v != nil {\nif n := len(v); n < 1 {\np.add(\"/\", \"want at least 1 properties, got %d\", n)\n}\n}"},
+		{`{type: object, maxProperties: 1}`, "if v != nil {\nif n := len(v); n > 1 {\np.add(\"/\", \"want at most 1 properties, got %d\", n)\n}\n}"},
+		{`{type: object, additionalProperties: {type: integer}}`, ""},
+		{`{type: object, additionalProperties: {type: integer, minimum: 0}}`, "for k1, v1 := range v {\nif v1 < 0 {\np.add(\"/\"+pointerToken(k1), \"must be >= 0\")\n}\n}"},
+		{`{type: array, items: {$ref: '#/components/schemas/S'}}`, "for i1, v1 := range v {\nif err := v1.Validate(); err != nil {\np.nest(\"/\"+strconv.Itoa(i1), err)\n}\n}"},
+	}
+	for _, tt := range tests {
+		got := checks(t, tt.payload, "components: {schemas: {S: {type: object, properties: {a: {type: string}}}}}")
+		if got != tt.want {
+			t.Errorf("%s:\n%s\nwant\n%s", tt.payload, got, tt.want)
+		}
+	}
+}
+
+func TestStructChecks(t *testing.T) {
+	decls, m, warnings, err := models(t, head+`
+components:
+  schemas:
+    S:
+      type: object
+      required: [list, req, tags, map, any, e, ref, n]
+      properties:
+        list: {type: array, items: {type: string}}
+        opt: {type: string, minLength: 1}
+        req: {type: string, minLength: 1}
+        tags: {$ref: '#/components/schemas/Tags'}
+        map: {type: object, additionalProperties: {type: string}}
+        any: {}
+        a/b~c: {type: integer, minimum: 0}
+        e: {$ref: '#/components/schemas/E'}
+        optE: {$ref: '#/components/schemas/E'}
+        ref: {$ref: '#/components/schemas/T'}
+        n: {$ref: '#/components/schemas/Name'}
+        rec: {$ref: '#/components/schemas/S'}
+        validate: {type: string}
+    T: {type: object, properties: {x: {type: string}}}
+    Tags: {type: array, maxItems: 1, items: {$ref: '#/components/schemas/Name'}}
+    Name: {type: string}
+    E: {enum: [a, b, a]}
+    F: {type: number, enum: [1, 1.0, 2.5]}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) > 0 {
+		t.Errorf("unexpected warnings %q", warnings)
+	}
+	got := strings.Join(decls["S"].Checks, "\n")
+	for _, c := range []string{
+		"if m.ABC != nil {\nif *m.ABC < 0 {\np.add(\"/a~1b~0c\", \"must be >= 0\")\n}\n}",
+		"if m.Any == nil {\np.add(\"/\", \"missing required property %q\", \"any\")\n}",
+		"if err := m.E.Validate(); err != nil {\np.nest(\"/e\", err)\n}",
+		"if m.List == nil {\np.add(\"/\", \"missing required property %q\", \"list\")\n}",
+		"if m.Map == nil {\np.add(\"/\", \"missing required property %q\", \"map\")\n}",
+		"if m.Opt != nil {\nif n := utf8.RuneCountInString(*m.Opt); n < 1 {\np.add(\"/opt\", \"want at least 1 characters, got %d\", n)\n}\n}",
+		"if m.OptE != nil {\nif err := m.OptE.Validate(); err != nil {\np.nest(\"/optE\", err)\n}\n}",
+		"if m.Rec != nil {\nif err := m.Rec.Validate(); err != nil {\np.nest(\"/rec\", err)\n}\n}",
+		"if err := m.Ref.Validate(); err != nil {\np.nest(\"/ref\", err)\n}",
+		"if n := utf8.RuneCountInString(m.Req); n < 1 {\np.add(\"/req\", \"want at least 1 characters, got %d\", n)\n}",
+		"if m.Tags == nil {\np.add(\"/\", \"missing required property %q\", \"tags\")\n}",
+		"if err := validateTags(m.Tags); err != nil {\np.nest(\"/tags\", err)\n}",
+	} {
+		if !strings.Contains(got, c) {
+			t.Errorf("S checks do not contain\n%s\nin\n%s", c, got)
+		}
+	}
+	for _, absent := range []string{"m.N ", "m.N.", "m.Req ==", "m.Ref ==", "m.E ==", "m.N ==", "m.Validate2"} {
+		if strings.Contains(got, absent) {
+			t.Errorf("S checks contain %q:\n%s", absent, got)
+		}
+	}
+	if !slices.ContainsFunc(decls["S"].Fields, func(f field) bool { return f.Name == "Validate2" && f.JSONName == "validate" }) {
+		t.Errorf("property validate is not field Validate2: %+v", decls["S"].Fields)
+	}
+	if got := decls["T"].Checks; got != nil {
+		t.Errorf("T checks = %q", got)
+	}
+	if d := decls["Name"]; d.Func != "" || d.Checks != nil {
+		t.Errorf("Name has a validator: %+v", d)
+	}
+	if d := decls["Tags"]; d.Func != "validateTags" {
+		t.Errorf("Tags func = %q", d.Func)
+	}
+	if d := decls["E"]; !slices.Equal(d.Cases, []string{"EA", "EB"}) || d.OneOf != `"/: must be one of [a b a]"` {
+		t.Errorf("E cases = %q, one of %s", d.Cases, d.OneOf)
+	}
+	if d := decls["F"]; !slices.Equal(d.Cases, []string{"FX1", "FX25"}) || d.OneOf != `"/: must be one of [1 1 2.5]"` {
+		t.Errorf("F cases = %q, one of %s", d.Cases, d.OneOf)
+	}
+	if !m.Validates || !slices.Contains(m.Imports, "unicode/utf8") || !slices.Contains(m.Imports, "fmt") {
+		t.Errorf("validates = %v, imports %q", m.Validates, m.Imports)
+	}
+}
+
+func TestValidatorOfPayload(t *testing.T) {
+	tests := []struct{ payload, validator, check string }{
+		{`{type: object, properties: {a: {type: string}}}`, "M.Validate", "msg.Validate()"},
+		{`{enum: [a]}`, "M.Validate", "msg.Validate()"},
+		{`{type: string, minLength: 1}`, "validateM", "validateM(msg)"},
+		{`{type: string}`, "", ""},
+		{`{$ref: '#/components/schemas/Name'}`, "", ""},
+		{`{$ref: '#/components/schemas/Short'}`, "validateShort", "validateShort(msg)"},
+		{`{type: array, items: {$ref: '#/components/schemas/S'}}`, "validateM", "validateM(msg)"},
+		{`{x-go-type: int}`, "", ""},
+		// An alias of a struct validates as the struct.
+		{`{$ref: '#/components/schemas/A'}`, "S.Validate", "msg.Validate()"},
+	}
+	for _, tt := range tests {
+		_, m, _, err := models(t, payloadDoc(tt.payload)+`
+components:
+  schemas:
+    Name: {type: string}
+    Short: {type: string, maxLength: 1}
+    S: {type: object, properties: {a: {type: string}}}
+    A: {allOf: [{$ref: '#/components/schemas/S'}]}
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := m.Ops[0].Message
+		if msg.Validator != tt.validator || msg.Check("msg") != tt.check {
+			t.Errorf("%s: validator %q, check %q; want %q, %q", tt.payload, msg.Validator, msg.Check("msg"), tt.validator, tt.check)
+		}
+	}
+	if got := (&message{Validator: ".Validate"}).Check("x"); got != ".Validate(x)" {
+		t.Errorf("Check = %q", got)
+	}
+}
+
+func TestValidationWarnings(t *testing.T) {
+	tests := []struct{ payload, want string }{
+		{`{type: string, format: uri}`, `M: format "uri" is not enforced`},
+		{`{type: integer, format: date}`, `M: format "date" is not enforced`},
+		{`{type: string, pattern: '(?=a)'}`, `M: pattern "(?=a)" is not enforced: Go's regexp package does not support it`},
+		{`{type: integer, minLength: 1}`, "M: minLength is not enforced"},
+		{`{type: string, minimum: 1}`, "M: minimum is not enforced"},
+		{`{type: string, const: 1}`, "M: const is not enforced"},
+		{`{type: integer, const: a}`, "M: const is not enforced"},
+		{`{type: boolean, const: 1}`, "M: const is not enforced"},
+		{`{type: string, format: date-time, minLength: 1}`, "M: minLength is not enforced"},
+		{`{type: string, format: byte, maxLength: 1}`, "M: maxLength is not enforced"},
+		{`{minLength: 1}`, "M: minLength is not enforced"},
+		{`{type: object, properties: {a: {type: string}}, minProperties: 1}`, "M: minProperties is not enforced"},
+		{`{type: object, properties: {a: {type: string}}, maxProperties: 1}`, "M: maxProperties is not enforced"},
+		{`{type: object, properties: {a: {type: string}}, additionalProperties: false}`, "M: additionalProperties is not enforced"},
+		{`{type: object, properties: {a: {type: string}}, additionalProperties: {type: string}}`, "M: additionalProperties is not enforced"},
+		{`{type: object, properties: {a: {type: string, not: {const: x}}}}`, "M.a: not is not enforced"},
+		{`{type: object, properties: {a: {type: array, items: {type: string, if: {}}}}}`, "M.a[]: if is not enforced"},
+		{`{type: object, additionalProperties: {type: string, then: {}}}`, "M[]: then is not enforced"},
+		{`{type: array, uniqueItems: true, items: {type: object, properties: {a: {type: string}}}}`, "M: uniqueItems is not enforced on items of type MItem"},
+		{`{type: array, uniqueItems: true}`, "M: uniqueItems is not enforced on items of type any"},
+		{`{type: array, uniqueItems: true, items: {type: string, format: date-time}}`, "M: uniqueItems is not enforced on items of type time.Time"},
+		{`{oneOf: [{type: string}]}`, "M: oneOf is generated as json.RawMessage and not validated"},
+	}
+	for _, kw := range constraintKeywords {
+		value := "{}"
+		switch kw {
+		case "maxItems", "maxLength", "maxProperties", "maximum", "minItems", "minLength", "minProperties", "minimum", "multipleOf",
+			"exclusiveMaximum", "exclusiveMinimum":
+			value = "1"
+		case "uniqueItems":
+			value = "true"
+		case "pattern":
+			value = "x"
+		}
+		tests = append(tests, struct{ payload, want string }{`{type: object, properties: {a: {}}, ` + kw + `: ` + value + `}`, "M: " + kw + " is not enforced"})
+	}
+	for _, tt := range tests {
+		_, _, warnings, err := models(t, payloadDoc(tt.payload))
 		if err != nil {
 			t.Errorf("%s: %v", tt.payload, err)
 			continue
@@ -196,79 +290,137 @@ func TestSchemaWarnings(t *testing.T) {
 		if !slices.Contains(warnings, tt.want) {
 			t.Errorf("%s: warnings %q do not contain %q", tt.payload, warnings, tt.want)
 		}
-		if tt.literal != "" && literals["schemaM"] != tt.literal {
-			t.Errorf("%s: literal = %s, want %s", tt.payload, literals["schemaM"], tt.literal)
-		}
 	}
-	_, _, warnings, _ := compileSchema(t, `{patternProperties: {a: {}}}`)
-	if len(warnings) != 1 {
-		t.Errorf("patternProperties alone: warnings = %q, want one", warnings)
+	// x-go-type ignores the rest of the schema without a word.
+	if _, _, warnings, _ := models(t, payloadDoc(`{x-go-type: string, minLength: 1}`)); len(warnings) > 0 {
+		t.Errorf("x-go-type: warnings %q", warnings)
+	}
+	for _, payload := range []string{
+		`{type: object, properties: {a: {type: string}}, additionalProperties: true}`,
+		`{type: object, properties: {a: {type: string}}, additionalProperties: {}}`,
+		`{type: array, uniqueItems: true, items: {enum: [a]}}`,
+		`{type: array, uniqueItems: true, items: {type: boolean}}`,
+		`{type: array, uniqueItems: true, items: {$ref: '#/components/schemas/N'}}`,
+	} {
+		_, _, warnings, err := models(t, payloadDoc(payload)+"components: {schemas: {N: {type: number}}}")
+		if err != nil || len(warnings) > 0 {
+			t.Errorf("%s: warnings %q, %v", payload, warnings, err)
+		}
 	}
 }
 
-func TestSchemaErrors(t *testing.T) {
+func TestValidationErrors(t *testing.T) {
 	tests := []struct{ payload, want string }{
-		{`{multipleOf: 0}`, "M: multipleOf must be greater than 0"},
-		{`{multipleOf: -1}`, "M: multipleOf must be greater than 0"},
-		{`{minimum: .inf}`, "M: minimum: must be finite, got +Inf"},
-		{`{maximum: -.inf}`, "M: maximum: must be finite, got -Inf"},
-		{`{multipleOf: .nan}`, "M: multipleOf: must be finite, got NaN"},
-		{`{exclusiveMinimum: .nan}`, "M: exclusiveMinimum: must be finite, got NaN"},
-		{`{exclusiveMaximum: .inf}`, "M: exclusiveMaximum: must be finite, got +Inf"},
-		{`{exclusiveMinimum: true}`, "M: exclusiveMinimum: true needs a bound next to it"},
-		{`{exclusiveMaximum: true}`, "M: exclusiveMaximum: true needs a bound next to it"},
-		{`{exclusiveMinimum: x}`, "M: exclusiveMinimum: must be a number, got x"},
-		{`{exclusiveMaximum: [1]}`, "M: exclusiveMaximum: must be a number, got [1]"},
-		{`{enum: [.inf]}`, "M: enum: must be finite, got +Inf"},
-		{`{enum: [[.nan]]}`, "M: enum: must be finite, got NaN"},
-		{`{enum: [{a: .inf}]}`, "M: enum: must be finite, got +Inf"},
-		{`{enum: [{1: a}]}`, "M: enum: map[1:a] (map[interface {}]interface {}) is not a JSON value"},
-		{`{const: .inf}`, "M: const: must be finite, got +Inf"},
-		{`{$ref: '#/components/schemas/Missing'}`, `"Missing" not found`},
-		{`{$ref: '#/info/title'}`, "cannot unmarshal"},
-		{`{$ref: '#/components/schemas/Bad'}`, "#/components/schemas/Bad: multipleOf must be greater than 0"},
-		{`{schemaFormat: application/vnd.apache.avro;version=1.9.0, schema: {}}`, "unsupported schemaFormat"},
-		{`{properties: {a: {schemaFormat: x, schema: {}}}}`, "unsupported schemaFormat"},
-		{`{properties: {a: {multipleOf: 0}}}`, "M/properties/a: multipleOf must be greater than 0"},
-		{`{additionalProperties: {type: [a, b]}}`, "cannot unmarshal"},
-		{`{additionalProperties: {multipleOf: 0}}`, "M/additionalProperties: multipleOf"},
-		{`{items: {multipleOf: 0}}`, "M/items: multipleOf"},
-		{`{allOf: [{}, {multipleOf: 0}]}`, "M/allOf/1: multipleOf"},
-		{`{anyOf: [{multipleOf: 0}]}`, "M/anyOf/0: multipleOf"},
-		{`{oneOf: [{multipleOf: 0}]}`, "M/oneOf/0: multipleOf"},
-		{`{not: {multipleOf: 0}}`, "M/not: multipleOf"},
-		{`{if: {multipleOf: 0}}`, "M/if: multipleOf"},
-		{`{then: {multipleOf: 0}}`, "M/then: multipleOf"},
-		{`{else: {multipleOf: 0}}`, "M/else: multipleOf"},
+		{`{type: integer, multipleOf: 0}`, "M: multipleOf must be a number greater than 0"},
+		{`{type: integer, multipleOf: -1}`, "M: multipleOf must be a number greater than 0"},
+		{`{type: number, multipleOf: .nan}`, "M: multipleOf must be a number greater than 0"},
+		{`{type: number, multipleOf: .inf}`, "M: multipleOf must be a number greater than 0"},
+		{`{type: number, minimum: .inf}`, "M: minimum: must be finite, got +Inf"},
+		{`{type: number, maximum: -.inf}`, "M: maximum: must be finite, got -Inf"},
+		{`{type: number, exclusiveMinimum: .nan}`, "M: exclusiveMinimum: must be finite, got NaN"},
+		{`{type: number, exclusiveMaximum: .inf}`, "M: exclusiveMaximum: must be finite, got +Inf"},
+		{`{type: number, exclusiveMinimum: true}`, "M: exclusiveMinimum: true needs a bound next to it"},
+		{`{type: number, exclusiveMaximum: true}`, "M: exclusiveMaximum: true needs a bound next to it"},
+		{`{type: number, exclusiveMinimum: x}`, "M: exclusiveMinimum: must be a number, got x"},
+		{`{type: number, exclusiveMaximum: [1]}`, "M: exclusiveMaximum: must be a number, got [1]"},
+		{`{type: object, properties: {a: {type: integer, multipleOf: 0}}}`, "M: M.a: multipleOf"},
+		{`{type: array, items: {type: integer, multipleOf: 0}}`, "M: M[]: multipleOf"},
+		{`{type: object, additionalProperties: {type: integer, multipleOf: 0}}`, "M: M[]: multipleOf"},
+		{`{type: object, additionalProperties: {type: [a, b]}}`, "cannot unmarshal"},
+		{`{type: array, items: {$ref: '#/components/schemas/Bad'}}`, "Bad: Bad: multipleOf must be a number greater than 0"},
 	}
 	for _, tt := range tests {
-		_, _, _, err := compileSchema(t, tt.payload)
+		more := ""
+		if strings.Contains(tt.payload, "Bad") {
+			more = "components: {schemas: {Bad: {type: integer, multipleOf: 0}}}"
+		}
+		_, _, _, err := models(t, payloadDoc(tt.payload)+more)
 		if err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%s: err = %v, want it to contain %q", tt.payload, err, tt.want)
 		}
 	}
 }
 
+func TestResolve(t *testing.T) {
+	vs := newValidators(newTypeSet(mustParse(t, head+`
+components:
+  schemas:
+    A: {$ref: '#/components/schemas/B'}
+    B: {allOf: [{$ref: '#/components/schemas/C'}]}
+    C: {type: string, minLength: 1}
+    Loop: {$ref: '#/components/schemas/Loop'}
+`), nil))
+	s, err := vs.resolve(&spec.Schema{Ref: "#/components/schemas/A"})
+	if err != nil || s.Type != "string" || *s.MinLength != 1 {
+		t.Errorf("resolve = %+v, %v", s, err)
+	}
+	if s, err := vs.resolve(nil); s != nil || err != nil {
+		t.Errorf("resolve(nil) = %v, %v", s, err)
+	}
+	if _, err := vs.resolve(&spec.Schema{Ref: "#/components/schemas/Missing"}); err == nil {
+		t.Error("missing ref resolved")
+	}
+	if _, err := vs.resolve(&spec.Schema{AllOf: []*spec.Schema{{Type: "string"}, {Type: "integer"}}}); err == nil {
+		t.Error("conflicting allOf resolved")
+	}
+	if _, err := vs.resolve(&spec.Schema{SchemaFormat: "x"}); err == nil {
+		t.Error("unsupported schemaFormat resolved")
+	}
+}
+
+func TestPath(t *testing.T) {
+	tests := []struct {
+		p     path
+		code  string
+		depth int
+	}{
+		{path{}, `"/"`, 0},
+		{path{}.prop("a"), `"/a"`, 0},
+		{path{}.prop("a/b~c").prop("d"), `"/a~1b~0c/d"`, 0},
+		{path{}.index("i"), `"/"+i`, 1},
+		{path{}.prop("a").index("i").prop("b").index("j"), `"/a/"+i+"/b/"+j`, 2},
+	}
+	for _, tt := range tests {
+		if got := tt.p.code(); got != tt.code || tt.p.depth() != tt.depth {
+			t.Errorf("%v: code %s, depth %d; want %s, %d", tt.p, got, tt.p.depth(), tt.code, tt.depth)
+		}
+	}
+	// Extending a path leaves it as it was.
+	base := make(path, 1, 4)
+	base[0] = segment{token: "a"}
+	b, c := base.prop("b"), base.prop("c")
+	if b.code() != `"/a/b"` || c.code() != `"/a/c"` {
+		t.Errorf("shared prefix: %s, %s", b.code(), c.code())
+	}
+}
+
+func TestPatternsAreShared(t *testing.T) {
+	_, m, _, err := models(t, payloadDoc(`{type: object, properties: {a: {type: string, pattern: x}, b: {type: string, pattern: x}, c: {type: string, pattern: y}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []pattern{{"pattern1", "x"}, {"pattern2", "y"}}
+	if !slices.Equal(m.Patterns, want) || m.Patterns[0].Literal() != `"x"` {
+		t.Errorf("patterns = %+v, want %+v", m.Patterns, want)
+	}
+}
+
 // TestValidationIsWired checks where the generated operations validate.
 func TestValidationIsWired(t *testing.T) {
-	out, _ := compile(t, allOperations)
+	out, _ := compile(t, strings.ReplaceAll(allOperations, "payload: {type: string}", "payload: {type: string, minLength: 1}"))
 	contains(t, out,
 		// Producer and Client check what they send.
-		"if err := schemaEvent.validate(body); err != nil {\n\t\treturn fmt.Errorf(\"Event: %w\", err)",
-		"if err := schemaLookup.validate(body); err != nil {\n\t\treturn resp, fmt.Errorf(\"Lookup: %w\", err)",
+		"if err := msg.Validate(); err != nil {\n\t\treturn fmt.Errorf(\"Event: %w\", err)",
+		"if err := validateLookup(req); err != nil {\n\t\treturn resp, fmt.Errorf(\"Lookup: %w\", err)",
 		// Consumer and Server check what they receive.
-		"decode(TicksChannel, schemaTick, msg)",
-		"decode(LookupsChannel, schemaLookup, msg)",
+		"decode(TicksChannel, validateTick, msg)",
+		"decode(LookupsChannel, validateLookup, msg)",
 		// Server checks its reply.
-		"if err := schemaAnswer.validate(body); err != nil {\n\t\t\t\treturn nil, fmt.Errorf(\"Answer: %w\", err)",
-		"*schemaTick = schema{Type: \"string\"}",
+		"if err := validateAnswer(resp); err != nil {\n\t\t\t\treturn nil, fmt.Errorf(\"Answer: %w\", err)",
+		"func (m Event) Validate() error {\n\treturn nil\n}",
 	)
-	// Only the operations' payloads are compiled, once each.
-	if n := strings.Count(out, "schemaLookup = &schema{}"); n != 1 || strings.Contains(out, "schemaLookup2") {
-		t.Errorf("schemaLookup declared %d times, or again under another name", n)
-	}
 
-	// Payloads without a schema are not checked.
+	// Payloads without constraints are not checked.
 	out, _ = compile(t, head+`
 channels:
   c: {address: a, messages: {m: {name: M}}}
@@ -279,45 +431,105 @@ operations:
   serve: {action: receive, channel: {$ref: '#/channels/c'}, reply: {channel: {$ref: '#/channels/r'}}}
 `)
 	contains(t, out, "decode(CChannel, nil, msg)", "return json.Marshal(resp)")
-	if strings.Contains(out, ".validate(body)") || strings.Contains(out, "func init()") {
-		t.Errorf("payloads without a schema are checked:\n%s", out)
+	if strings.Contains(out, "Validate") || strings.Contains(out, "ValidationError") {
+		t.Errorf("payloads without constraints are checked:\n%s", out)
 	}
 
-	// The models alone have no validator.
+	// The models alone have their Validate methods.
 	doc := mustParse(t, allOperations)
 	models, err := Generate(doc, Options{Package: "p", Parts: []Part{PartModels}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	typecheck(t, string(models))
-	if strings.Contains(string(models), "schema") {
-		t.Errorf("models contain the validator:\n%s", models)
-	}
-
-	// Errors in a payload schema are reported with the message.
-	_, err = generate(t, payloadDoc(`{multipleOf: 0}`))
-	if err == nil || !strings.Contains(err.Error(), "message M payload: M: multipleOf must be greater than 0") {
-		t.Errorf("err = %v", err)
+	contains(t, string(models), "func (m Event) Validate() error", "type ValidationError struct")
+	if strings.Contains(string(models), "decode") {
+		t.Errorf("models contain the runtime:\n%s", models)
 	}
 }
 
-// TestKeywordsCompile checks that every keyword compiles into valid code.
-func TestKeywordsCompile(t *testing.T) {
-	_, warnings := compile(t, payloadDoc(`{
-		type: object, required: [a], additionalProperties: false, minProperties: 1, maxProperties: 9,
+// TestValidationCompiles checks that every enforced keyword compiles into
+// valid code, alone and in the models part.
+func TestValidationCompiles(t *testing.T) {
+	src := payloadDoc(`{
+		type: object, required: [a, b, d],
 		properties: {
-			a: {type: string, minLength: 1, maxLength: 9, pattern: '^a', format: uuid, enum: [a], const: a},
-			b: {type: array, items: {type: integer}, minItems: 1, maxItems: 2, uniqueItems: true},
-			c: {type: number, minimum: 0, maximum: 9, exclusiveMinimum: 0, exclusiveMaximum: 9, multipleOf: 0.5},
-			d: {type: object, additionalProperties: {type: boolean}},
-			e: {allOf: [{type: string}], not: {const: x}, if: {const: y}, then: {}, else: {}},
-			f: {anyOf: [{type: string}]},
-			g: {oneOf: [{type: string}]}
+			a: {type: string, minLength: 1, maxLength: 9, pattern: '^a', format: uuid, const: a},
+			b: {type: array, items: {type: integer, format: int32, maximum: 1e12}, minItems: 1, maxItems: 2, uniqueItems: true},
+			c: {type: number, format: float, minimum: 0, maximum: 9, exclusiveMinimum: 0, exclusiveMaximum: 9, multipleOf: 0.5},
+			d: {type: object, minProperties: 1, additionalProperties: {type: boolean, const: true}},
+			e: {type: array, items: {type: array, items: {type: string, format: date}}},
+			f: {type: string, format: time}, g: {type: string, format: email},
+			h: {type: string, format: ipv4}, i: {type: string, format: ipv6},
+			j: {type: integer, multipleOf: 2, const: 4},
+			k: {$ref: '#/components/schemas/K'}
 		}
-	}`))
-	for _, w := range warnings {
-		if strings.Contains(w, "enforced") {
-			t.Errorf("unexpected warning %q", w)
+	}`) + `
+components:
+  schemas:
+    K: {type: array, items: {type: string, pattern: '^a'}}`
+	out, warnings := compile(t, src)
+	if len(warnings) > 0 {
+		t.Errorf("unexpected warnings %q", warnings)
+	}
+	contains(t, out, "func validateK(v K) error", "func isUUID(", "func isDate(", "func isTime(", "func isEmail(",
+		"func isIPv4(", "func isIPv6(", "func duplicate[", "func pointerToken(", "func multipleOf(")
+	if strings.Count(out, "regexp.MustCompile") != 1 {
+		t.Errorf("patterns are compiled more than once:\n%s", out)
+	}
+	models, err := Generate(mustParse(t, src), Options{Package: "p", Parts: []Part{PartModels}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typecheck(t, string(models))
+
+	// Helpers that are not used are left out.
+	out, _ = compile(t, payloadDoc(`{type: string, minLength: 1}`))
+	for _, helper := range []string{"isUUID", "duplicate", "pointerToken", "multipleOf", "regexp"} {
+		if strings.Contains(out, helper) {
+			t.Errorf("unused %s generated:\n%s", helper, out)
+		}
+	}
+}
+
+// TestAllOfMergesConstraints checks that allOf members contribute their
+// constraints, and that a $ref with constraints next to it is not taken as
+// the referenced type alone.
+func TestAllOfMergesConstraints(t *testing.T) {
+	tests := []struct{ payload, want string }{
+		{`{allOf: [{type: integer, minimum: 1}, {maximum: 9}]}`, fails("v < 1", `"must be >= 1"`) + "\n" + fails("v > 9", `"must be <= 9"`)},
+		{`{allOf: [{type: integer, exclusiveMinimum: 1}, {exclusiveMaximum: 9}]}`, fails("v <= 1", `"must be > 1"`) + "\n" + fails("v >= 9", `"must be < 9"`)},
+		{`{allOf: [{type: integer}, {multipleOf: 2}]}`, fails("v%2 != 0", `"must be a multiple of 2"`)},
+		{`{allOf: [{type: string}, {maxLength: 2}]}`, "if n := utf8.RuneCountInString(v); n > 2 {\np.add(\"/\", \"want at most 2 characters, got %d\", n)\n}"},
+		{`{allOf: [{type: string}, {pattern: x}]}`, fails("!pattern1.MatchString(v)", `"does not match %s", pattern1`)},
+		{`{allOf: [{type: array}, {minItems: 1}]}`, "if v != nil {\nif n := len(v); n < 1 {\np.add(\"/\", \"want at least 1 items, got %d\", n)\n}\n}"},
+		{`{allOf: [{type: array}, {maxItems: 1}]}`, "if v != nil {\nif n := len(v); n > 1 {\np.add(\"/\", \"want at most 1 items, got %d\", n)\n}\n}"},
+		{`{allOf: [{type: array, items: {type: string}}, {uniqueItems: true}]}`, "if v != nil {\nif i, j, dup := duplicate(v); dup {\np.add(\"/\", \"items %d and %d are equal\", i, j)\n}\n}"},
+		{`{allOf: [{type: object}, {minProperties: 1}]}`, "if v != nil {\nif n := len(v); n < 1 {\np.add(\"/\", \"want at least 1 properties, got %d\", n)\n}\n}"},
+		{`{allOf: [{type: object}, {maxProperties: 1}]}`, "if v != nil {\nif n := len(v); n > 1 {\np.add(\"/\", \"want at most 1 properties, got %d\", n)\n}\n}"},
+		{`{allOf: [{$ref: '#/components/schemas/N'}], maximum: 9}`, fails("v > 9", `"must be <= 9"`)},
+	}
+	for _, tt := range tests {
+		if got := checks(t, tt.payload, "components: {schemas: {N: {type: integer}}}"); got != tt.want {
+			t.Errorf("%s:\n%s\nwant\n%s", tt.payload, got, tt.want)
+		}
+	}
+	// A constraint next to a lone $ref keeps M from being N.
+	_, m, warnings, err := models(t, payloadDoc(`{allOf: [{$ref: '#/components/schemas/N'}], minLength: 1}`)+"components: {schemas: {N: {type: integer}}}")
+	if err != nil || m.Ops[0].Message.Type != "M" || !slices.Contains(warnings, "M: minLength is not enforced") {
+		t.Errorf("type %s, warnings %q, %v", m.Ops[0].Message.Type, warnings, err)
+	}
+	_, m, _, _ = models(t, payloadDoc(`{allOf: [{$ref: '#/components/schemas/N'}], description: d}`)+"components: {schemas: {N: {type: integer}}}")
+	if m.Ops[0].Message.Type != "N" {
+		t.Errorf("lone $ref: type %s, want N", m.Ops[0].Message.Type)
+	}
+
+	for _, payload := range []string{
+		`{allOf: [{type: integer, minimum: 1}, {minimum: 2}]}`,
+		`{allOf: [{type: string, pattern: a}, {pattern: b}]}`,
+	} {
+		if _, _, _, err := models(t, payloadDoc(payload)); err == nil || !strings.Contains(err.Error(), "allOf: conflicting") {
+			t.Errorf("%s: err = %v", payload, err)
 		}
 	}
 }
