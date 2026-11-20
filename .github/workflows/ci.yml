@@ -29,3 +29,27 @@ jobs:
           go mod vendor
           git add -N .
           git diff --exit-code
+
+  # Builds the release binaries and Docker images without publishing them,
+  # then checks that the amd64 image regenerates the orders example unchanged.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --snapshot --clean
+      - name: Image regenerates the orders example unchanged
+        run: |
+          image=$(docker images --filter 'reference=ghcr.io/jnszkr/go-asyncapi:*-amd64' --format '{{.Repository}}:{{.Tag}}' | head -n 1)
+          test -n "$image"
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/examples/orders:/work" "$image" -spec asyncapi.yaml -out gen/orders
+          git diff --exit-code
