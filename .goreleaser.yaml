@@ -16,6 +16,21 @@ archives:
       - goos: windows
         formats: [zip]
 
+# The generator is a static binary that needs neither the Go toolchain nor
+# the network at run time, so the image is just that binary on scratch.
+dockers_v2:
+  - images:
+      - ghcr.io/jnszkr/go-asyncapi
+    tags:
+      - "{{ .Tag }}"
+      - latest
+    labels:
+      org.opencontainers.image.source: https://github.com/jnszkr/go-asyncapi
+      org.opencontainers.image.description: Generate typed Go clients for NATS from AsyncAPI 3.0/3.1 specs
+      org.opencontainers.image.licenses: Apache-2.0
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+
 checksum:
   name_template: checksums.txt
 
