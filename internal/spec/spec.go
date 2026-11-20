@@ -2,7 +2,11 @@
 // the generator understands, including the NATS bindings.
 package spec
 
-import "gopkg.in/yaml.v3"
+import (
+	"slices"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Document is an AsyncAPI 3.0 or 3.1 document.
 type Document struct {
@@ -143,8 +147,28 @@ type Schema struct {
 	AnyOf                []*Schema          `yaml:"anyOf"`
 	AllOf                []*Schema          `yaml:"allOf"`
 	Const                any                `yaml:"const"`
-	Not                  any                `yaml:"not"`
-	If                   any                `yaml:"if"`
+	Not                  *Schema            `yaml:"not"`
+	If                   *Schema            `yaml:"if"`
+	Then                 *Schema            `yaml:"then"`
+	Else                 *Schema            `yaml:"else"`
+
+	// Validation keywords.
+	Minimum    *float64 `yaml:"minimum"`
+	Maximum    *float64 `yaml:"maximum"`
+	MultipleOf *float64 `yaml:"multipleOf"`
+	// ExclusiveMinimum and ExclusiveMaximum are numbers since draft-06; a
+	// boolean (draft-04) makes Minimum or Maximum exclusive instead.
+	ExclusiveMinimum any    `yaml:"exclusiveMinimum"`
+	ExclusiveMaximum any    `yaml:"exclusiveMaximum"`
+	MinLength        *int   `yaml:"minLength"`
+	MaxLength        *int   `yaml:"maxLength"`
+	Pattern          string `yaml:"pattern"`
+	MinItems         *int   `yaml:"minItems"`
+	MaxItems         *int   `yaml:"maxItems"`
+	UniqueItems      bool   `yaml:"uniqueItems"`
+	MinProperties    *int   `yaml:"minProperties"`
+	MaxProperties    *int   `yaml:"maxProperties"`
+
 	// SchemaFormat and Inner make this a Multi Format Schema. Inner stays
 	// undecoded because other formats, such as Protobuf, are not JSON Schema.
 	SchemaFormat string    `yaml:"schemaFormat"`
@@ -153,6 +177,32 @@ type Schema struct {
 	// of generating one. GoTypeImport is the import path of its package.
 	GoType       string `yaml:"x-go-type"`
 	GoTypeImport string `yaml:"x-go-type-import"`
+
+	// Keywords are the keys the schema was written with, in order, including
+	// those this struct does not model.
+	Keywords []string `yaml:"-"`
+}
+
+func (s *Schema) UnmarshalYAML(n *yaml.Node) error {
+	type plain Schema
+	if err := n.Decode((*plain)(s)); err != nil {
+		return err
+	}
+	if n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	s.Keywords = nil
+	if n.Kind == yaml.MappingNode {
+		for i := 0; i < len(n.Content); i += 2 {
+			s.Keywords = append(s.Keywords, n.Content[i].Value)
+		}
+	}
+	return nil
+}
+
+// Has reports whether the schema was written with keyword.
+func (s *Schema) Has(keyword string) bool {
+	return slices.Contains(s.Keywords, keyword)
 }
 
 type Components struct {

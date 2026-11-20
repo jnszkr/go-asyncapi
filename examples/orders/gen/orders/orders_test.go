@@ -75,7 +75,7 @@ func TestPublishSubscribe(t *testing.T) {
 	order := orders.Order{
 		ID:     "o-1",
 		Status: orders.OrderStatusPending,
-		Items:  []orders.LineItem{{SKU: "sku-1", Quantity: 3}},
+		Items:  []orders.LineItem{{SKU: "SKU-1", Quantity: 3}},
 	}
 	headers := map[string][]string{orders.OrderCreatedHeaderTraceID: {"trace-1"}}
 	if err := orders.NewProducer(b).PublishOrderCreated(context.Background(), orders.OrderCreatedParams("eu"), headers, order); err != nil {
@@ -148,14 +148,18 @@ func TestConsumerSettles(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r.deliver("orders.eu.created", `{"id":"ok"}`)
-	r.deliver("orders.eu.created", `{"id":"retry"}`)
-	r.deliver("orders.eu.created", `{"id":"bad"}`)
+	order := func(id string) string {
+		return `{"id":"` + id + `","status":"paid","items":[{"sku":"SKU-1","quantity":1}]}`
+	}
+	r.deliver("orders.eu.created", order("ok"))
+	r.deliver("orders.eu.created", order("retry"))
+	r.deliver("orders.eu.created", order("bad"))
 	r.deliver("orders.eu.created", `{`)
-	r.deliver("orders.eu.x.created", `{"id":"ok"}`)
-	r.deliver("orders.eu.deleted", `{"id":"ok"}`)
+	r.deliver("orders.eu.x.created", order("ok"))
+	r.deliver("orders.eu.deleted", order("ok"))
+	r.deliver("orders.eu.created", `{"id":"ok"}`)
 
-	want := []orders.Settlement{orders.Ack, orders.Nak, orders.Term, orders.Term, orders.Term, orders.Term}
+	want := []orders.Settlement{orders.Ack, orders.Nak, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term}
 	if !slices.Equal(r.settled, want) {
 		t.Errorf("settled = %v, want %v", r.settled, want)
 	}
@@ -175,6 +179,9 @@ func TestConsumerSettles(t *testing.T) {
 	}
 	if !strings.Contains(r.errs[3].Error(), "orders.eu.created: decode") {
 		t.Errorf("decode error = %q", r.errs[3])
+	}
+	if !strings.Contains(r.errs[6].Error(), `orders.eu.created: invalid payload: /: missing required property "items"`) {
+		t.Errorf("validation error = %q", r.errs[6])
 	}
 }
 
@@ -222,12 +229,12 @@ func TestClientReportsUndecodableReply(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := orders.NewClient(b).GetOrderStatus(context.Background(), nil, orders.StatusRequest{})
+	_, err := orders.NewClient(b).GetOrderStatus(context.Background(), nil, orders.StatusRequest{OrderID: "o-1"})
 	if err == nil || !strings.Contains(err.Error(), "unmarshal StatusReply") {
 		t.Errorf("err = %v, want an unmarshal error", err)
 	}
 
-	_, err = orders.NewClient(membroker.New()).GetOrderStatus(context.Background(), nil, orders.StatusRequest{})
+	_, err = orders.NewClient(membroker.New()).GetOrderStatus(context.Background(), nil, orders.StatusRequest{OrderID: "o-1"})
 	if !errors.Is(err, membroker.ErrNoResponders) || !strings.Contains(err.Error(), "request orders.status.get") {
 		t.Errorf("err = %v, want no responders", err)
 	}
@@ -282,7 +289,7 @@ func TestApplicationSuppliedTransports(t *testing.T) {
 	var handlerID any
 	sub, err := orders.NewServer(serverSide{nb}).ServeOrderStatus(func(ctx context.Context, m orders.Received[orders.StatusRequest]) (orders.StatusReply, error) {
 		handlerID = ctx.Value(requestIDKey{})
-		return orders.StatusReply{OrderID: m.Payload.OrderID}, nil
+		return orders.StatusReply{OrderID: m.Payload.OrderID, Status: orders.OrderStatusPending}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +349,7 @@ func TestJetStream(t *testing.T) {
 	b := jsbroker.New(js, jsbroker.WithConsumers(consumers))
 
 	// Published before anyone subscribes: the stream keeps it.
-	if err := orders.NewProducer(b).PublishOrderCreated(ctx, orders.OrderCreatedParams("us"), nil, orders.Order{ID: "o-3"}); err != nil {
+	if err := orders.NewProducer(b).PublishOrderCreated(ctx, orders.OrderCreatedParams("us"), nil, validOrder("o-3")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -423,5 +430,224 @@ func TestMalformedError(t *testing.T) {
 	err := orders.Terminate(inner)
 	if !errors.Is(err, inner) || err.Error() != "malformed message: inner" || !broker.IsMalformed(err) {
 		t.Errorf("Terminate(inner) = %v", err)
+	}
+}
+
+func validOrder(id string) orders.Order {
+	return orders.Order{ID: id, Status: orders.OrderStatusPaid, Items: []orders.LineItem{{SKU: "ABC-1", Quantity: 1}}}
+}
+
+// TestProducerValidates checks that an order that does not match its schema
+// is not published, and that the error says why.
+func TestProducerValidates(t *testing.T) {
+	b := membroker.New()
+	published := 0
+	if _, err := b.Subscribe("orders.*.created", "", func(context.Context, broker.Inbox) (broker.Settlement, error) {
+		published++
+		return broker.Ack, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := orders.NewProducer(b)
+	ctx, params := context.Background(), orders.OrderCreatedParams("eu")
+	shippedAt := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	email := "a@example.com"
+	total := 9.5
+
+	valid := []func(*orders.Order){
+		func(*orders.Order) {},
+		func(o *orders.Order) { o.Status, o.ShippedAt = orders.OrderStatusShipped, &shippedAt },
+		func(o *orders.Order) { o.Status = orders.OrderStatusShipped },
+		func(o *orders.Order) { o.CustomerEmail, o.Total = &email, &total },
+		func(o *orders.Order) { o.Items[0].Quantity = 1000 },
+		func(o *orders.Order) { o.Metadata = map[string]string{"k": "v"} },
+		func(o *orders.Order) {
+			o.Category = &orders.Category{Name: "a", Children: []orders.Category{{Name: "b", Children: []orders.Category{{Name: "c"}}}}}
+		},
+	}
+	for i, change := range valid {
+		o := validOrder("o-1")
+		change(&o)
+		if err := p.PublishOrderCreated(ctx, params, nil, o); err != nil {
+			t.Errorf("valid order %d: %v", i, err)
+		}
+	}
+	if published != len(valid) {
+		t.Fatalf("published %d orders, want %d", published, len(valid))
+	}
+
+	bad := "not-an-email"
+	negative := -1.0
+	invalid := map[string]struct {
+		change func(*orders.Order)
+		want   string
+	}{
+		"empty id":         {func(o *orders.Order) { o.ID = "" }, "/id: want at least 1 characters, got 0"},
+		"no items":         {func(o *orders.Order) { o.Items = nil }, `/: missing required property "items"`},
+		"empty items":      {func(o *orders.Order) { o.Items = []orders.LineItem{} }, "/items: want at least 1 items, got 0"},
+		"unknown status":   {func(o *orders.Order) { o.Status = "lost" }, "/status: must be one of [pending paid shipped cancelled]"},
+		"sku pattern":      {func(o *orders.Order) { o.Items[0].SKU = "abc-1" }, "/items/0/sku: does not match ^[A-Z]{3}-[0-9]+$"},
+		"quantity minimum": {func(o *orders.Order) { o.Items[0].Quantity = 0 }, "/items/0/quantity: must be >= 1"},
+		"quantity maximum": {func(o *orders.Order) { o.Items[0].Quantity = 1001 }, "/items/0/quantity: must be <= 1000"},
+		"negative total":   {func(o *orders.Order) { o.Total = &negative }, "/total: must be >= 0"},
+		"email format":     {func(o *orders.Order) { o.CustomerEmail = &bad }, "/customerEmail: not a valid email"},
+		"recursive schema": {func(o *orders.Order) {
+			o.Category = &orders.Category{Name: "a", Children: []orders.Category{{Name: "b", Children: []orders.Category{{Name: ""}}}}}
+		}, "/category/children/0/children/0/name: want at least 1 characters, got 0"},
+	}
+	for name, tc := range invalid {
+		t.Run(name, func(t *testing.T) {
+			o := validOrder("o-1")
+			tc.change(&o)
+			err := p.PublishOrderCreated(ctx, params, nil, o)
+			var verr *orders.ValidationError
+			if !errors.As(err, &verr) || !slices.Contains(verr.Problems, tc.want) {
+				t.Fatalf("err = %v, want a ValidationError with %q", err, tc.want)
+			}
+			if broker.IsMalformed(err) {
+				t.Errorf("outgoing validation error %v is malformed", err)
+			}
+		})
+	}
+	if published != len(valid) {
+		t.Errorf("published %d orders, want only the %d valid ones", published, len(valid))
+	}
+
+	// Several problems are reported together, in a stable order.
+	o := validOrder("")
+	o.Status = "lost"
+	o.Items[0].SKU = "x"
+	err := p.PublishOrderCreated(ctx, params, nil, o)
+	const want = "Order: invalid payload: /id: want at least 1 characters, got 0; /items/0/sku: does not match ^[A-Z]{3}-[0-9]+$; /status: must be one of [pending paid shipped cancelled]"
+	if err == nil || err.Error() != want {
+		t.Errorf("err = %v\nwant %s", err, want)
+	}
+}
+
+// TestConsumerTerminatesInvalidMessages checks that a received message whose
+// payload does not validate, or does not decode, is terminated without
+// calling the handler.
+func TestConsumerTerminatesInvalidMessages(t *testing.T) {
+	r := &recorder{}
+	called := 0
+	if _, err := orders.NewConsumer(r).OnOrderCreated(func(context.Context, orders.Received[orders.Order]) error {
+		called++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"category":{"name":"a","children":[{"name":"b"}]}}`,
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"category":{"name":"a","children":[{"name":""}]}}`,
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":0}]}`,
+		`{"id":"o-1","status":"lost","items":[{"sku":"ABC-1","quantity":1}]}`,
+		`{"id":"o-1","status":"paid"}`,
+	} {
+		r.deliver("orders.eu.created", body)
+	}
+	for _, body := range []string{
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1.5}]}`,
+		`{"id":"o-1","status":"paid","items":[{"sku":"ABC-1","quantity":1}],"metadata":{"k":1}}`,
+		`{"id":"o-1","status":"shipped","items":[{"sku":"ABC-1","quantity":1}],"shippedAt":"yesterday"}`,
+	} {
+		r.deliver("orders.eu.created", body)
+	}
+	want := []orders.Settlement{orders.Ack, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term, orders.Term}
+	if !slices.Equal(r.settled, want) || called != 1 {
+		t.Fatalf("settled = %v, handler called %d times; want %v, once", r.settled, called, want)
+	}
+	for i, problem := range []string{
+		"/category/children/0/name: want at least 1 characters, got 0",
+		"/items/0/quantity: must be >= 1",
+		"/status: must be one of [pending paid shipped cancelled]",
+		`/: missing required property "items"`,
+	} {
+		err := r.errs[i+1]
+		var verr *orders.ValidationError
+		if !broker.IsMalformed(err) || !errors.As(err, &verr) || !slices.Contains(verr.Problems, problem) {
+			t.Errorf("delivery %d: err = %v, want a malformed ValidationError with %q", i+1, err, problem)
+		}
+	}
+	for i := 5; i < 8; i++ {
+		err := r.errs[i]
+		var verr *orders.ValidationError
+		if !broker.IsMalformed(err) || errors.As(err, &verr) || !strings.Contains(err.Error(), "orders.eu.created: decode: ") {
+			t.Errorf("delivery %d: err = %v, want a malformed decode error", i, err)
+		}
+	}
+}
+
+// TestValidate checks the Validate methods directly.
+func TestValidate(t *testing.T) {
+	if err := validOrder("o-1").Validate(); err != nil {
+		t.Errorf("valid order: %v", err)
+	}
+	if err := orders.OrderStatusShipped.Validate(); err != nil {
+		t.Errorf("valid status: %v", err)
+	}
+	err := orders.OrderStatus("lost").Validate()
+	var verr *orders.ValidationError
+	if !errors.As(err, &verr) || !slices.Equal(verr.Problems, []string{"/: must be one of [pending paid shipped cancelled]"}) {
+		t.Errorf("invalid status: err = %v", err)
+	}
+	err = orders.Order{}.Validate()
+	want := []string{
+		`/: missing required property "items"`,
+		"/id: want at least 1 characters, got 0",
+		"/status: must be one of [pending paid shipped cancelled]",
+	}
+	if !errors.As(err, &verr) || !slices.Equal(verr.Problems, want) {
+		t.Errorf("empty order: err = %v, want %q", err, want)
+	}
+}
+
+// TestRequestReplyValidates checks validation on both sides of a request: the
+// client does not send an invalid request, the server answers one with 400
+// without calling the handler, and an invalid reply becomes a 500.
+func TestRequestReplyValidates(t *testing.T) {
+	b := natsbroker.New(connect(t))
+	called := 0
+	sub, err := orders.NewServer(b).ServeOrderStatus(func(_ context.Context, m orders.Received[orders.StatusRequest]) (orders.StatusReply, error) {
+		called++
+		if m.Payload.OrderID == "broken" {
+			return orders.StatusReply{OrderID: "broken", Status: "lost"}, nil
+		}
+		return orders.StatusReply{OrderID: m.Payload.OrderID, Status: orders.OrderStatusPaid}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c := orders.NewClient(b)
+
+	_, err = c.GetOrderStatus(ctx, nil, orders.StatusRequest{})
+	var verr *orders.ValidationError
+	if !errors.As(err, &verr) || err.Error() != "StatusRequest: invalid payload: /orderId: want at least 1 characters, got 0" {
+		t.Errorf("invalid request: err = %v", err)
+	}
+	if called != 0 {
+		t.Errorf("handler called %d times for a request the client must not send", called)
+	}
+
+	var remote *broker.RemoteError
+	_, _, err = b.Request(ctx, "orders.status.get", nil, []byte(`{"orderId":""}`))
+	if !errors.As(err, &remote) || remote.Code != "400" || !strings.Contains(remote.Description, "/orderId: want at least 1 characters") {
+		t.Errorf("invalid request sent anyway: err = %v, want RemoteError 400", err)
+	}
+	if called != 0 {
+		t.Errorf("handler called %d times for an invalid request", called)
+	}
+
+	_, err = c.GetOrderStatus(ctx, nil, orders.StatusRequest{OrderID: "broken"})
+	if !errors.As(err, &remote) || remote.Code != "500" ||
+		remote.Description != "StatusReply: invalid payload: /status: must be one of [pending paid shipped cancelled]" {
+		t.Errorf("invalid reply: err = %v, want RemoteError 500", err)
+	}
+
+	resp, err := c.GetOrderStatus(ctx, nil, orders.StatusRequest{OrderID: "o-1"})
+	if err != nil || resp.Status != orders.OrderStatusPaid {
+		t.Errorf("valid request: %+v, %v", resp, err)
 	}
 }

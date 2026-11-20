@@ -26,6 +26,19 @@ type typeDecl struct {
 	Under   string // underlying type for "enum" and "alias"
 	Values  []enumValue
 	Imports []string
+
+	// Checks are the statements of the Validate method of a struct, or of
+	// the function Func validating an alias. They add the violations of the
+	// value to p.
+	Checks []string
+	Func   string
+	// Cases are the distinct constants of an enum, and OneOf the Go literal
+	// of the problem a value not among them has.
+	Cases []string
+	OneOf string
+
+	schema  *spec.Schema // nil for x-go-type
+	checked bool         // whether Func is decided
 }
 
 // enumValue is a constant of an "enum" type.
@@ -40,6 +53,8 @@ type field struct {
 	Type     string
 	Doc      string
 	Required bool
+
+	schema *spec.Schema
 }
 
 // typeSet tracks generated named types and the imports they require.
@@ -75,16 +90,6 @@ func (ts *typeSet) warn(format string, args ...any) {
 		ts.onWarn(w)
 	}
 	ts.warned[w] = true
-}
-
-// warnIgnored warns about keywords that have no effect on the generated type.
-func (ts *typeSet) warnIgnored(s *spec.Schema, name string) {
-	if s.Not != nil {
-		ts.warn("%s: not is not enforced", name)
-	}
-	if s.If != nil {
-		ts.warn("%s: if is not enforced", name)
-	}
 }
 
 // uniqueName returns name, or name with a numeric suffix if it is taken.
@@ -126,7 +131,7 @@ func (ts *typeSet) namedType(s *spec.Schema, nameHint string) (string, error) {
 		return t, nil
 	}
 	name := ts.uniqueName(nameHint)
-	ts.add(&typeDecl{Name: name, Kind: "alias", Under: t, Doc: schemaDoc(s)})
+	ts.add(&typeDecl{Name: name, Kind: "alias", Under: t, Doc: schemaDoc(s), schema: s})
 	return name, nil
 }
 
@@ -175,7 +180,6 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 		}
 		return ts.goType(merged, nameHint)
 	}
-	ts.warnIgnored(s, nameHint)
 
 	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
 		// TODO(phase 2): typed unions.
@@ -183,7 +187,7 @@ func (ts *typeSet) goType(s *spec.Schema, nameHint string) (string, error) {
 		if len(s.OneOf) == 0 {
 			keyword = "anyOf"
 		}
-		ts.warn("%s: %s is generated as json.RawMessage", nameHint, keyword)
+		ts.warn("%s: %s is generated as json.RawMessage and not validated", nameHint, keyword)
 		ts.imports["encoding/json"] = true
 		return "json.RawMessage", nil
 	}
@@ -265,8 +269,7 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 	}
 	ts.declaring[s] = true
 	defer delete(ts.declaring, s)
-	ts.warnIgnored(s, name)
-	d := &typeDecl{Name: name, Doc: schemaDoc(s)}
+	d := &typeDecl{Name: name, Doc: schemaDoc(s), schema: s}
 	// Reserve the name before descending into properties.
 	ts.add(d)
 
@@ -279,7 +282,7 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 		if t == name {
 			return fmt.Errorf("%s: x-go-type %q refers to itself: the generated package declares %s, so name a type in another package", name, t, name)
 		}
-		d.Kind, d.Under = "alias", t
+		d.Kind, d.Under, d.schema = "alias", t, nil
 	case schemaType(s) == "object" && len(s.Properties) > 0:
 		d.Kind = "struct"
 		required := map[string]bool{}
@@ -291,10 +294,8 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 			props = append(props, p)
 		}
 		sort.Strings(props)
-		if ap, ok := s.AdditionalProperties.(map[string]any); ok && len(ap) > 0 {
-			ts.warn("%s: additionalProperties next to properties is not enforced", name)
-		}
-		fields := map[string]bool{}
+		// The Validate method takes the name from a property.
+		fields := map[string]bool{"Validate": true}
 		for _, p := range props {
 			if !validJSONName(p) {
 				return fmt.Errorf("%s: property %q cannot be written in a json struct tag", name, p)
@@ -309,7 +310,7 @@ func (ts *typeSet) declare(s *spec.Schema, name string) error {
 				t = "*" + t
 			}
 			d.Fields = append(d.Fields, field{
-				Name: uniqueIn(fields, exportName(p)), JSONName: p, Type: t, Required: req, Doc: schemaDoc(ps),
+				Name: uniqueIn(fields, exportName(p)), JSONName: p, Type: t, Required: req, Doc: schemaDoc(ps), schema: ps,
 			})
 		}
 	case len(s.Enum) > 0 && slices.Contains([]string{"string", "integer", "number"}, schemaType(s)):
@@ -342,13 +343,15 @@ func (ts *typeSet) flatten(s *spec.Schema, depth int) (*spec.Schema, error) {
 		return nil, fmt.Errorf("allOf nested too deep (cycle?)")
 	}
 	bare := s.Type == "" && len(s.Properties) == 0 && len(s.Required) == 0 && s.Items == nil &&
-		len(s.Enum) == 0 && s.Const == nil && len(s.OneOf) == 0 && len(s.AnyOf) == 0 && s.AdditionalProperties == nil
+		len(s.Enum) == 0 && s.Const == nil && len(s.OneOf) == 0 && len(s.AnyOf) == 0 && s.AdditionalProperties == nil &&
+		!slices.ContainsFunc(constraintKeywords, s.Has)
 	if len(s.AllOf) == 1 && bare {
 		return s.AllOf[0], nil
 	}
 	out := *s
 	out.AllOf = nil
 	out.Properties = maps.Clone(s.Properties)
+	out.Keywords = slices.Clone(s.Keywords)
 	for _, m := range s.AllOf {
 		member, _, err := ts.doc.ResolveSchema(m)
 		if err != nil {
@@ -386,6 +389,19 @@ func mergeSchema(out, m *spec.Schema) error {
 		{"enum", out.Enum, m.Enum, func() { out.Enum = m.Enum }},
 		{"const", out.Const, m.Const, func() { out.Const = m.Const }},
 		{"additionalProperties", out.AdditionalProperties, m.AdditionalProperties, func() { out.AdditionalProperties = m.AdditionalProperties }},
+		{"minimum", out.Minimum, m.Minimum, func() { out.Minimum = m.Minimum }},
+		{"maximum", out.Maximum, m.Maximum, func() { out.Maximum = m.Maximum }},
+		{"exclusiveMinimum", out.ExclusiveMinimum, m.ExclusiveMinimum, func() { out.ExclusiveMinimum = m.ExclusiveMinimum }},
+		{"exclusiveMaximum", out.ExclusiveMaximum, m.ExclusiveMaximum, func() { out.ExclusiveMaximum = m.ExclusiveMaximum }},
+		{"multipleOf", out.MultipleOf, m.MultipleOf, func() { out.MultipleOf = m.MultipleOf }},
+		{"minLength", out.MinLength, m.MinLength, func() { out.MinLength = m.MinLength }},
+		{"maxLength", out.MaxLength, m.MaxLength, func() { out.MaxLength = m.MaxLength }},
+		{"pattern", out.Pattern, m.Pattern, func() { out.Pattern = m.Pattern }},
+		{"minItems", out.MinItems, m.MinItems, func() { out.MinItems = m.MinItems }},
+		{"maxItems", out.MaxItems, m.MaxItems, func() { out.MaxItems = m.MaxItems }},
+		{"uniqueItems", out.UniqueItems, m.UniqueItems, func() { out.UniqueItems = m.UniqueItems }},
+		{"minProperties", out.MinProperties, m.MinProperties, func() { out.MinProperties = m.MinProperties }},
+		{"maxProperties", out.MaxProperties, m.MaxProperties, func() { out.MaxProperties = m.MaxProperties }},
 	} {
 		switch {
 		case isZero(kw.src):
@@ -407,12 +423,7 @@ func mergeSchema(out, m *spec.Schema) error {
 	out.Required = append(out.Required, m.Required...)
 	out.OneOf = append(out.OneOf, m.OneOf...)
 	out.AnyOf = append(out.AnyOf, m.AnyOf...)
-	if out.Not == nil {
-		out.Not = m.Not
-	}
-	if out.If == nil {
-		out.If = m.If
-	}
+	out.Keywords = append(out.Keywords, m.Keywords...)
 	if out.Description == "" {
 		out.Description = m.Description
 	}

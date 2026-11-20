@@ -23,6 +23,12 @@ type model struct {
 	Channels []*channel
 	Ops      []*operation
 	APIs     []*apiType
+	// Validates says whether the types have Validate methods or functions,
+	// which need the ValidationError runtime. Helpers are the helper
+	// functions they call, and Patterns their compiled regular expressions.
+	Validates bool
+	Helpers   map[string]bool
+	Patterns  []pattern
 }
 
 // apiType is a generated type holding the operations of one Part.
@@ -89,6 +95,20 @@ type message struct {
 	Name        string
 	Type        string // Go payload type
 	ContentType string
+	// Validator is a func(Type) error validating payloads, or "" if
+	// nothing constrains them.
+	Validator string
+}
+
+// Check returns the expression validating the payload arg, or "".
+func (m *message) Check(arg string) string {
+	if name, ok := strings.CutSuffix(m.Validator, ".Validate"); ok && name != "" {
+		return arg + ".Validate()"
+	}
+	if m.Validator == "" {
+		return ""
+	}
+	return m.Validator + "(" + arg + ")"
 }
 
 // headerDecl lists the header names of a message as constants.
@@ -190,10 +210,14 @@ func (m *model) Has(part Part) bool {
 // runtimeNames are the top-level names the template declares besides those
 // derived from the document, for the selected parts.
 func (m *model) runtimeNames() []string {
-	if len(m.Ops) == 0 {
-		return nil
+	var names []string
+	if m.Validates {
+		names = append(names, "ValidationError")
 	}
-	names := []string{"Params", "Channel"}
+	if len(m.Ops) == 0 {
+		return names
+	}
+	names = append(names, "Params", "Channel")
 	if m.HasReceive() {
 		names = append(names, "Endpoint", "Received", "Inbox", "Subscription", "MalformedError")
 	}
@@ -256,6 +280,19 @@ func buildModel(doc *spec.Document, pkg string, warn func(string)) (*model, erro
 	}
 	slices.SortFunc(b.types.decls, func(a, b *typeDecl) int { return strings.Compare(a.Name, b.Name) })
 	breakRecursion(b.types.decls)
+	vs := newValidators(b.types)
+	if err := vs.run(); err != nil {
+		return nil, err
+	}
+	for _, msg := range b.messages {
+		msg.Validator = vs.funcExpr(msg.Type)
+	}
+	if m.Validates = vs.generates(); m.Validates {
+		for _, imp := range []string{"fmt", "slices", "strings"} {
+			b.types.imports[imp] = true
+		}
+	}
+	m.Helpers, m.Patterns = vs.helpers, vs.patterns
 	m.Types = b.types.decls
 	m.Headers = b.headers
 	for imp := range b.types.imports {

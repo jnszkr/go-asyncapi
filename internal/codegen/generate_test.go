@@ -23,6 +23,7 @@ var update = flag.Bool("update", false, "rewrite golden files")
 func TestGolden(t *testing.T) {
 	examples := []struct{ spec, out, pkg string }{
 		{"../../examples/orders/asyncapi.yaml", "../../examples/orders/gen/orders/asyncapi.gen.go", "orders"},
+		{"../../examples/validation/asyncapi.yaml", "../../examples/validation/gen/validation/asyncapi.gen.go", "validation"},
 	}
 	for _, ex := range examples {
 		t.Run(ex.pkg, func(t *testing.T) {
@@ -582,12 +583,12 @@ operations:
 // declare it.
 func TestRuntimeNameClash(t *testing.T) {
 	names := map[Part][]string{
-		PartProducer: {"Params", "Channel", "Publisher"},
-		PartConsumer: {"Params", "Channel", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Subscriber", "Settlement", "Ack", "Nak", "Term", "Terminate"},
-		PartClient:   {"Params", "Channel", "Requester"},
-		PartServer:   {"Params", "Channel", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Replier"},
+		PartProducer: {"Params", "Channel", "ValidationError", "Publisher"},
+		PartConsumer: {"Params", "Channel", "ValidationError", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Subscriber", "Settlement", "Ack", "Nak", "Term", "Terminate"},
+		PartClient:   {"Params", "Channel", "ValidationError", "Requester"},
+		PartServer:   {"Params", "Channel", "ValidationError", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Replier"},
 	}
-	all := []string{"Params", "Channel", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Publisher", "Subscriber", "Settlement", "Ack", "Nak", "Term", "Terminate", "Requester", "Replier"}
+	all := []string{"Params", "Channel", "ValidationError", "Endpoint", "Received", "Inbox", "Subscription", "MalformedError", "Publisher", "Subscriber", "Settlement", "Ack", "Nak", "Term", "Terminate", "Requester", "Replier"}
 	for part, taken := range names {
 		for _, name := range all {
 			doc, err := spec.Parse([]byte(allOperations + "components:\n  schemas:\n    " + name + ": {type: string}\n"))
@@ -599,7 +600,9 @@ func TestRuntimeNameClash(t *testing.T) {
 			if got := err != nil && strings.Contains(err.Error(), "clashes with the generated "+name); got != want {
 				t.Errorf("%s with a type %s: err = %v, want a clash: %v", part, name, err, want)
 			}
-			if _, err := Generate(doc, Options{Package: "p", Parts: []Part{PartModels}}); err != nil {
+			// The Validate methods of the models need ValidationError.
+			_, err = Generate(doc, Options{Package: "p", Parts: []Part{PartModels}})
+			if clash := err != nil && strings.Contains(err.Error(), "clashes with the generated ValidationError"); (err != nil) != (name == "ValidationError") || (err != nil && !clash) {
 				t.Errorf("models with a type %s: %v", name, err)
 			}
 		}

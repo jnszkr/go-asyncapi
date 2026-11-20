@@ -1,0 +1,94 @@
+asyncapi: 3.0.0
+info:
+  title: Validation
+  version: 1.0.0
+  description: Exercises every keyword the generated Validate methods enforce.
+
+servers:
+  local:
+    host: localhost:4222
+    protocol: nats
+
+channels:
+  samples:
+    address: samples
+    messages:
+      sample:
+        payload:
+          $ref: '#/components/schemas/Sample'
+  codes:
+    address: codes
+    messages:
+      codes:
+        payload:
+          $ref: '#/components/schemas/Codes'
+
+operations:
+  publishSample:
+    action: send
+    channel:
+      $ref: '#/channels/samples'
+  publishCodes:
+    action: send
+    channel:
+      $ref: '#/channels/codes'
+  onCodes:
+    action: receive
+    channel:
+      $ref: '#/channels/codes'
+
+components:
+  schemas:
+    Sample:
+      type: object
+      required: [tags]
+      properties:
+        int: {type: integer, multipleOf: 3}
+        int32: {type: integer, format: int32, minimum: -5, maximum: 1e12}
+        frac: {type: integer, exclusiveMinimum: 1.5}
+        dec: {type: number, multipleOf: 0.1, exclusiveMinimum: 0, exclusiveMaximum: 1}
+        float: {type: number, format: float, minimum: 0.5}
+        draft4: {type: number, minimum: 0, exclusiveMinimum: true, maximum: 10, exclusiveMaximum: true}
+        str: {type: string, minLength: 2, maxLength: 3}
+        min: {type: string, minLength: 1}
+        max: {type: string, maxLength: 1}
+        date: {type: string, format: date}
+        time: {type: string, format: time}
+        dateTime: {type: string, format: date-time}
+        uuid: {type: string, format: uuid}
+        email: {type: string, format: email}
+        ipv4: {type: string, format: ipv4}
+        ipv6: {type: string, format: ipv6}
+        tags: {type: array, uniqueItems: true, minItems: 1, maxItems: 3, items: {type: string}}
+        codes: {$ref: '#/components/schemas/Codes'}
+        counts: {type: object, minProperties: 1, maxProperties: 2, additionalProperties: {type: integer, minimum: 0}}
+        matrix: {type: array, items: {type: array, items: {type: integer, minimum: 0}}}
+        constStr: {const: x}
+        constNum: {type: number, const: 1.5}
+        constInt: {type: integer, const: 3}
+        constTrue: {const: true}
+        constFalse: {const: false}
+        allOf: {allOf: [{type: string}, {minLength: 2}]}
+        color: {$ref: '#/components/schemas/Color'}
+        tree: {$ref: '#/components/schemas/Tree'}
+        a/b~c: {type: integer, minimum: 0}
+    Code:
+      type: string
+      pattern: '^[A-Z]{2}$'
+    Codes:
+      type: array
+      maxItems: 2
+      uniqueItems: true
+      items:
+        $ref: '#/components/schemas/Code'
+    Color:
+      type: string
+      enum: [red, green]
+    Tree:
+      type: object
+      properties:
+        value: {type: integer, minimum: 0}
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tree'

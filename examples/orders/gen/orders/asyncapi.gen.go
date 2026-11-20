@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Transport. Implement these interfaces to carry the messages, or use the
@@ -158,7 +161,9 @@ func (e *MalformedError) Error() string   { return "malformed message: " + e.Err
 func (e *MalformedError) Unwrap() error   { return e.Err }
 func (e *MalformedError) Malformed() bool { return true }
 
-func decode[T any](ch Channel[T], in Inbox) (Received[T], error) {
+// decode checks a received message against its channel, decodes it and
+// validates the payload with valid, which may be nil.
+func decode[T any](ch Channel[T], valid func(T) error, in Inbox) (Received[T], error) {
 	r := Received[T]{Subject: in.Subject(), Headers: in.Headers()}
 	var err error
 	if r.Params, err = ch.ParseSubject(r.Subject); err != nil {
@@ -166,6 +171,11 @@ func decode[T any](ch Channel[T], in Inbox) (Received[T], error) {
 	}
 	if err := json.Unmarshal(in.Data(), &r.Payload); err != nil {
 		return r, &MalformedError{Err: fmt.Errorf("%s: decode: %w", r.Subject, err)}
+	}
+	if valid != nil {
+		if err := valid(r.Payload); err != nil {
+			return r, &MalformedError{Err: fmt.Errorf("%s: %w", r.Subject, err)}
+		}
 	}
 	return r, nil
 }
@@ -187,21 +197,153 @@ func settle(err error) (Settlement, error) {
 	}
 }
 
+// ValidationError is about a value that breaks the constraints of its
+// schema. A received payload that does not validate is wrapped in a
+// MalformedError; one about to be sent is returned as is.
+type ValidationError struct {
+	// Problems are the violations, sorted, each prefixed with a JSON
+	// Pointer to where in the value it is.
+	Problems []string
+}
+
+func (e *ValidationError) Error() string {
+	return "invalid payload: " + strings.Join(e.Problems, "; ")
+}
+
+// violations collects the problems a Validate method finds.
+type violations []string
+
+func (p *violations) add(at, format string, args ...any) {
+	*p = append(*p, at+": "+fmt.Sprintf(format, args...))
+}
+
+// nest adds the problems of err, about the value at, under at.
+func (p *violations) nest(at string, err error) {
+	v, ok := err.(*ValidationError)
+	if !ok {
+		p.add(at, "%v", err)
+		return
+	}
+	for _, q := range v.Problems {
+		if strings.HasPrefix(q, "/:") {
+			q = q[1:] // about the value itself
+		}
+		*p = append(*p, at+q)
+	}
+}
+
+func (p violations) err() error {
+	if len(p) == 0 {
+		return nil
+	}
+	slices.Sort(p)
+	return &ValidationError{Problems: p}
+}
+
+var (
+	pattern1 = regexp.MustCompile("^[A-Z]{3}-[0-9]+$")
+)
+
+func isEmail(s string) bool {
+	local, domain, ok := strings.Cut(s, "@")
+	return ok && local != "" && domain != "" && !strings.ContainsAny(domain, "@ ")
+}
+
+// A product category; categories nest.
+type Category struct {
+	Children []Category `json:"children,omitempty"`
+	Name     string     `json:"name"`
+}
+
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m Category) Validate() error {
+	var p violations
+	for i1, v1 := range m.Children {
+		if err := v1.Validate(); err != nil {
+			p.nest("/children/"+strconv.Itoa(i1), err)
+		}
+	}
+	if n := utf8.RuneCountInString(m.Name); n < 1 {
+		p.add("/name", "want at least 1 characters, got %d", n)
+	}
+	return p.err()
+}
+
 // LineItem is generated from the AsyncAPI document.
 type LineItem struct {
 	Quantity int32  `json:"quantity"`
 	SKU      string `json:"sku"`
 }
 
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m LineItem) Validate() error {
+	var p violations
+	if m.Quantity < 1 {
+		p.add("/quantity", "must be >= 1")
+	}
+	if m.Quantity > 1000 {
+		p.add("/quantity", "must be <= 1000")
+	}
+	if !pattern1.MatchString(m.SKU) {
+		p.add("/sku", "does not match %s", pattern1)
+	}
+	return p.err()
+}
+
 // Order is generated from the AsyncAPI document.
 type Order struct {
-	CustomerEmail *string `json:"customerEmail,omitempty"`
+	Category      *Category `json:"category,omitempty"`
+	CustomerEmail *string   `json:"customerEmail,omitempty"`
 	// Unique order identifier.
-	ID       string            `json:"id"`
-	Items    []LineItem        `json:"items"`
-	Metadata map[string]string `json:"metadata,omitempty"`
-	Status   OrderStatus       `json:"status"`
-	Total    *float64          `json:"total,omitempty"`
+	ID        string            `json:"id"`
+	Items     []LineItem        `json:"items"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	ShippedAt *time.Time        `json:"shippedAt,omitempty"`
+	Status    OrderStatus       `json:"status"`
+	Total     *float64          `json:"total,omitempty"`
+}
+
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m Order) Validate() error {
+	var p violations
+	if m.Category != nil {
+		if err := m.Category.Validate(); err != nil {
+			p.nest("/category", err)
+		}
+	}
+	if m.CustomerEmail != nil {
+		if !isEmail(*m.CustomerEmail) {
+			p.add("/customerEmail", "not a valid email")
+		}
+	}
+	if n := utf8.RuneCountInString(m.ID); n < 1 {
+		p.add("/id", "want at least 1 characters, got %d", n)
+	}
+	if m.Items == nil {
+		p.add("/", "missing required property %q", "items")
+	}
+	if m.Items != nil {
+		if n := len(m.Items); n < 1 {
+			p.add("/items", "want at least 1 items, got %d", n)
+		}
+		for i1, v1 := range m.Items {
+			if err := v1.Validate(); err != nil {
+				p.nest("/items/"+strconv.Itoa(i1), err)
+			}
+		}
+	}
+	if err := m.Status.Validate(); err != nil {
+		p.nest("/status", err)
+	}
+	if m.Total != nil {
+		if *m.Total < 0 {
+			p.add("/total", "must be >= 0")
+		}
+	}
+	return p.err()
 }
 
 // OrderStatus is generated from the AsyncAPI document.
@@ -214,6 +356,16 @@ const (
 	OrderStatusCancelled OrderStatus = "cancelled"
 )
 
+// Validate returns a *ValidationError if v is not one of the OrderStatus
+// constants, or nil.
+func (v OrderStatus) Validate() error {
+	switch v {
+	case OrderStatusPending, OrderStatusPaid, OrderStatusShipped, OrderStatusCancelled:
+		return nil
+	}
+	return &ValidationError{Problems: []string{"/: must be one of [pending paid shipped cancelled]"}}
+}
+
 // StatusReply is generated from the AsyncAPI document.
 type StatusReply struct {
 	OrderID   string      `json:"orderId"`
@@ -221,9 +373,29 @@ type StatusReply struct {
 	UpdatedAt *time.Time  `json:"updatedAt,omitempty"`
 }
 
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m StatusReply) Validate() error {
+	var p violations
+	if err := m.Status.Validate(); err != nil {
+		p.nest("/status", err)
+	}
+	return p.err()
+}
+
 // StatusRequest is generated from the AsyncAPI document.
 type StatusRequest struct {
 	OrderID string `json:"orderId"`
+}
+
+// Validate returns a *ValidationError listing how m breaks the constraints
+// of its schema, or nil.
+func (m StatusRequest) Validate() error {
+	var p violations
+	if n := utf8.RuneCountInString(m.OrderID); n < 1 {
+		p.add("/orderId", "want at least 1 characters, got %d", n)
+	}
+	return p.err()
 }
 
 // Header names.
@@ -275,6 +447,9 @@ func (c *Producer) PublishOrderCreated(ctx context.Context, params Params, heade
 	if err != nil {
 		return err
 	}
+	if err := msg.Validate(); err != nil {
+		return fmt.Errorf("Order: %w", err)
+	}
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal Order: %w", err)
@@ -293,11 +468,12 @@ func NewConsumer(t Subscriber) *Consumer { return &Consumer{t: t} }
 // Operation "onOrderCreated": receive on orders.{region}.created (queue "order-processors").
 //
 // h returning nil acks the message, an error naks it, and an error made with
-// Terminate terminates it. Malformed messages are terminated without calling h.
+// Terminate terminates it. Malformed messages, including those whose payload
+// does not validate, are terminated without calling h.
 func (c *Consumer) OnOrderCreated(h func(ctx context.Context, m Received[Order]) error) (Subscription, error) {
 	return c.t.Subscribe(OnOrderCreatedEndpoint.Subject, OnOrderCreatedEndpoint.Queue,
 		func(ctx context.Context, msg Inbox) (Settlement, error) {
-			r, err := decode(OrderCreatedChannel, msg)
+			r, err := decode(OrderCreatedChannel, Order.Validate, msg)
 			if err != nil {
 				return Term, err
 			}
@@ -318,6 +494,9 @@ func (c *Client) GetOrderStatus(ctx context.Context, headers map[string][]string
 	subject, err := OrderStatusChannel.Subject(nil)
 	if err != nil {
 		return resp, err
+	}
+	if err := req.Validate(); err != nil {
+		return resp, fmt.Errorf("StatusRequest: %w", err)
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -341,18 +520,23 @@ func NewServer(t Replier) *Server { return &Server{t: t} }
 
 // Operation "serveOrderStatus": receive on orders.status.get (queue "order-status").
 //
-// An error from h is sent to the requester; malformed requests are answered
-// with an error without calling h.
+// An error from h is sent to the requester; malformed requests, including
+// those whose payload does not validate, are answered with an error without
+// calling h. A reply that does not validate is not sent: the requester gets
+// an error instead.
 func (c *Server) ServeOrderStatus(h func(ctx context.Context, m Received[StatusRequest]) (StatusReply, error)) (Subscription, error) {
 	return c.t.Reply(ServeOrderStatusEndpoint.Subject, ServeOrderStatusEndpoint.Queue,
 		func(ctx context.Context, msg Inbox) ([]byte, error) {
-			r, err := decode(OrderStatusChannel, msg)
+			r, err := decode(OrderStatusChannel, StatusRequest.Validate, msg)
 			if err != nil {
 				return nil, err
 			}
 			resp, err := h(ctx, r)
 			if err != nil {
 				return nil, err
+			}
+			if err := resp.Validate(); err != nil {
+				return nil, fmt.Errorf("StatusReply: %w", err)
 			}
 			return json.Marshal(resp)
 		})

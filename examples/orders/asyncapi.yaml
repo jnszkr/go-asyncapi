@@ -85,6 +85,7 @@ components:
         properties:
           orderId:
             type: string
+            minLength: 1
     StatusReply:
       payload:
         type: object
@@ -105,16 +106,25 @@ components:
         id:
           type: string
           description: Unique order identifier.
+          minLength: 1
         customerEmail:
           type: string
+          format: email
         items:
           type: array
+          minItems: 1
           items:
             $ref: '#/components/schemas/LineItem'
         status:
           $ref: '#/components/schemas/OrderStatus'
         total:
           type: number
+          minimum: 0
+        shippedAt:
+          type: string
+          format: date-time
+        category:
+          $ref: '#/components/schemas/Category'
         metadata:
           type: object
           additionalProperties:
@@ -125,9 +135,24 @@ components:
       properties:
         sku:
           type: string
+          pattern: '^[A-Z]{3}-[0-9]+$'
         quantity:
           type: integer
           format: int32
+          minimum: 1
+          maximum: 1000
+    Category:
+      type: object
+      description: A product category; categories nest.
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Category'
     OrderStatus:
       type: string
       enum: [pending, paid, shipped, cancelled]

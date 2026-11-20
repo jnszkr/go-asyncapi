@@ -290,25 +290,9 @@ func TestConstIsTypedAndDocumented(t *testing.T) {
 	contains(t, out, `// Must be "created".`, "Kind string", "// Must be 3.", "N int64")
 }
 
-func TestIgnoredKeywordsWarn(t *testing.T) {
-	tests := map[string]struct{ payload, want string }{
-		"not":                  {`{type: object, properties: {k: {not: {type: integer}}}}`, "not is not enforced"},
-		"if":                   {`{type: object, properties: {k: {if: {type: integer}}}}`, "if is not enforced"},
-		"root":                 {`{type: object, not: {required: [a]}, properties: {a: {type: string}}}`, "not is not enforced"},
-		"additionalProperties": {`{type: object, properties: {a: {type: string}}, additionalProperties: {type: integer}}`, "additionalProperties next to properties is not enforced"},
-	}
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			_, warnings := compile(t, payloadDoc(tc.payload))
-			warned(t, warnings, tc.want)
-		})
-	}
-}
-
 func TestSupportedDocumentsDoNotWarn(t *testing.T) {
 	for _, payload := range []string{
 		`{type: object, properties: {a: {type: string}}, additionalProperties: true}`,
-		`{type: object, properties: {a: {type: string}}, additionalProperties: false}`,
 		`{type: object, additionalProperties: {type: integer}}`,
 		`{type: object, additionalProperties: {}}`,
 		`{type: object, properties: {a: {}}, additionalProperties: {}}`,
